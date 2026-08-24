@@ -40,7 +40,6 @@ logs/
 *.key
 *sk*
 *secret*
-*eval*
 context.seal
 pk.bin
 sk.bin
