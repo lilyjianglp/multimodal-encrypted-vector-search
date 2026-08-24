@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.13)
+project(ckks_dump LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_package(SEAL REQUIRED)
+add_executable(ckks_decrypt_dump ckks_decrypt_dump.cpp)
+target_link_libraries(ckks_decrypt_dump SEAL::seal)

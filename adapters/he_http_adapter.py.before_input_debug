@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import json
+from flask import Flask, request, jsonify
+import argparse, os, base64, pathlib, sys, grpc, struct, re
+from typing import Any, List, Tuple
+
+# 让 Python 能 import 同目录下生成的 *_pb2*.py
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import hecompute_pb2 as pb
+import hecompute_pb2_grpc as pbg
+
+SCALE_DEFAULT = float(2 ** 40)
+
+# ---------------- utils ----------------
+def b64d(s: Any) -> bytes:
+    if isinstance(s, str):
+        s = s.encode()
+    return base64.b64decode(s, validate=True)
+
+def b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+def safe_int(x, d):
+    try: return int(x)
+    except: return d
+
+def safe_float(x, d):
+    try: return float(x)
+    except: return d
+
+def _read_diag_pack(mmap_path: str) -> List[bytes]:
+    """
+    读取 DIA1 打包文件（blk-*.dia），返回其中按顺序保存的 N 条 Plaintext.save() 字节。
+    支持相对路径：cwd、脚本目录、以及 DIAG_ROOT 环境变量下的相对路径。
+    """
+    path = pathlib.Path(mmap_path)
+
+    if not path.is_absolute():
+        cand = [
+            pathlib.Path.cwd() / path,
+            pathlib.Path(__file__).parent / path,
+        ]
+        diag_root = os.environ.get("DIAG_ROOT")
+        if diag_root:
+            cand.append(pathlib.Path(diag_root) / path)
+
+        for p in cand:
+            if p.exists():
+                path = p
+                break
+        else:
+            tried = ", ".join(str(c) for c in cand)
+            raise FileNotFoundError(f"diag pack not found: {mmap_path} (tried: {tried})")
+
+    with open(path, "rb") as f:
+        data = f.read()
+
+    if len(data) < 8:
+        raise ValueError(f"diag pack too small: {path}")
+
+    if data[:4] != b"DIA1":
+        raise ValueError(f"bad magic in diag pack {path}: {data[:4]!r} (expect b'DIA1')")
+
+    (count,) = struct.unpack("<I", data[4:8])
+    off = 8
+    out: List[bytes] = []
+    for i in range(count):
+        if off + 4 > len(data):
+            raise ValueError(f"diag pack truncated at item {i}: no length")
+        (ln,) = struct.unpack("<I", data[off:off+4]); off += 4
+        if off + ln > len(data):
+            raise ValueError(f"diag pack truncated at item {i}: need {ln} bytes")
+        out.append(data[off:off+ln]); off += ln
+    return out
+
+def _pick_dim(payload: dict) -> int:
+    """从请求或环境变量取 dim，默认 768。"""
+    if isinstance(payload, dict) and "dim" in payload and payload["dim"] is not None:
+        try: return int(payload["dim"])
+        except: pass
+    try: return int(os.environ.get("DIAG_DIM", "768"))
+    except: return 768
+
+def _scan_max_offset_from_blocks(diag_obj: dict) -> int:
+    """扫描 diag_blocks.blocks[*].layout.diag_offsets 或 blocks[*].diag_offsets 的最大 offset。"""
+    max_off = -1
+    try:
+        blocks = []
+        if isinstance(diag_obj, dict) and "blocks" in diag_obj and isinstance(diag_obj["blocks"], list):
+            blocks = diag_obj["blocks"]
+        elif isinstance(diag_obj, list):
+            blocks = diag_obj
+
+        for blk in blocks:
+            offs = []
+            if isinstance(blk, dict):
+                ly = blk.get("layout", {}) or {}
+                if isinstance(ly.get("diag_offsets"), list):
+                    offs.extend(ly["diag_offsets"])
+                if isinstance(blk.get("diag_offsets"), list):
+                    offs.extend(blk["diag_offsets"])
+            for v in offs:
+                if isinstance(v, int) and v > max_off:
+                    max_off = v
+    except Exception:
+        pass
+    return max_off
+
+def _build_bsgs_if_empty(payload: dict) -> Tuple[List[int], List[int]]:
+    """
+    若请求没有 bsgs/bsgs_plan，则自动生成：
+      baby = [0..b-1]  (b = env BSGS_B or 16)
+      giant = [0, b, 2b, ...] 覆盖到 max_offset
+      max_offset 来自 diag_offsets；如无则取 dim-1
+    """
+    bsgs_src = {}
+    if isinstance(payload.get("bsgs"), dict):
+        bsgs_src = payload["bsgs"]
+    elif isinstance(payload.get("bsgs_plan"), dict):
+        bsgs_src = payload["bsgs_plan"]
+
+    baby  = [int(x) for x in bsgs_src.get("baby",  [])] if isinstance(bsgs_src, dict) else []
+    giant = [int(x) for x in bsgs_src.get("giant", [])] if isinstance(bsgs_src, dict) else []
+
+    if baby and giant:
+        return baby, giant
+
+    dim = _pick_dim(payload)
+    max_off = _scan_max_offset_from_blocks(payload.get("diag_blocks") or payload.get("blocks") or {})
+    if max_off < 0:
+        max_off = max(0, dim - 1)
+
+    b = safe_int(os.environ.get("BSGS_B", 16), 16)
+    if b <= 0: b = 16
+
+    baby  = list(range(b))
+    gcnt  = (max_off + 1 + b - 1) // b
+    giant = [i * b for i in range(gcnt)]
+    return baby, giant
+
+def _infer_block_start(blk_in: dict, mmap_path: str, idx: int) -> int:
+    """
+    推断块的起始 offset：
+      1) 优先从 mmap 文件名解析：blk-000128.dia -> 128
+      2) 其次从 block_id/字符串中解析内嵌数字
+      3) 退回 idx*128
+    """
+    # 1) 文件名
+    try:
+        fname = pathlib.Path(mmap_path).name  # blk-000128.dia
+        m = re.search(r"blk-(\d+)", fname.lower())
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+
+    # 2) block_id
+    try:
+        bid = str(blk_in.get("block_id", ""))
+        m = re.search(r"(\d+)", bid)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+
+    # 3) 回退
+    return idx * 128
+
+# ---------------- app ----------------
+def create_app(grpc_addr: str):
+    app = Flask("he_http_adapter")
+
+    # 增大发送/接收上限
+    opts = [
+        ("grpc.max_send_message_length", 256 * 1024 * 1024),
+        ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+    ]
+    channel = grpc.insecure_channel(grpc_addr, options=opts)
+    stub = pbg.HeComputeServiceStub(channel)
+
+    @app.get("/health")
+    def health():
+        return jsonify({"service": "he_http_adapter", "grpc": grpc_addr, "status": "healthy"})
+
+    @app.post("/eval-keys")
+    def eval_keys():
+        j = request.get_json(force=True) or {}
+        client_id = j.get("client_id") or j.get("session_id") or "clientA"
+        key_ver   = j.get("key_ver", "v1")
+        try:
+            galois = b64d(j.get("galois","")) if j.get("galois") else b""
+            relin  = b64d(j.get("relin",""))  if j.get("relin")  else b""
+        except Exception as e:
+            return jsonify({"error":"bad_request","details":f"invalid base64: {e}"}), 400
+        try:
+            grpc.channel_ready_future(channel).result(timeout=3)
+            rep = stub.EvalKeys(pb.EvalKeysRequest(
+                client_id=client_id, key_ver=key_ver, galois=galois, relin=relin
+            ), timeout=15, wait_for_ready=True)
+            print(f"[he_http_adapter] EvalKeys ok client_id={client_id} key_ver={key_ver}", flush=True)
+            return jsonify({"ok": rep.ok, "msg": rep.msg})
+        except grpc.RpcError as e:
+            return jsonify({"error":"grpc_failed","details":str(e)}), 500
+
+    @app.post("/score/batch")
+    def score_batch():
+        j = request.get_json(force=True) or {}
+        # --- multimodal mode support ---
+        mode = j.get("mode", "image")  # default image
+
+        if mode == "image":
+            os.environ["DIAG_ROOT"] = "/home/wen/Desktop/backend/ckks/image/D0512"
+        elif mode == "audio":
+            os.environ["DIAG_ROOT"] = "/home/wen/Desktop/backend/ckks/audio/D0512"
+        elif mode == "text":
+            os.environ["DIAG_ROOT"] = "/home/wen/Desktop/backend/ckks/text/D0512"
+        print(f"[he_http_adapter] MODE={mode}, DIAG_ROOT={os.environ['DIAG_ROOT']}", flush=True)
+         # ---- Force override diag_blocks.root ----
+        if "diag_blocks" in j and isinstance(j["diag_blocks"], dict):
+            # 强制 root 为空，让 mmap_path 使用 DIAG_ROOT + mmap_path
+            j["diag_blocks"]["root"] = ""
+        if "blocks" in j and isinstance(j["blocks"], dict):
+            j["blocks"]["root"] = ""
+        client_id = j.get("client_id") or j.get("session_id") or "gw"
+        key_ver   = j.get("key_ver", "v1")
+        scale     = safe_float(j.get("scale", SCALE_DEFAULT), SCALE_DEFAULT)
+
+        # —— ct_q —— 
+        try:
+            if "ct_q" not in j:
+                return jsonify({"error":"bad_request","details":"missing ct_q"}), 400
+            ct_q_bytes = b64d(j["ct_q"])
+        except Exception as e:
+            return jsonify({"error":"bad_request","details":f"invalid base64 ct_q: {e}"}), 400
+
+        print(f"[he_http_adapter] ScoreBatch <- ct_q bytes len={len(ct_q_bytes)} head16={ct_q_bytes[:16].hex()}", flush=True)
+
+        # —— BSGS：优先用请求体；为空则自动生成 —— 
+        baby, giant = _build_bsgs_if_empty(j)
+        print(f"[he_http_adapter] BSGS plan: baby={len(baby)} giant={len(giant)} "
+              f"max_giant={(giant[-1] if giant else -1)} b_guess={(len(baby) if baby else -1)}",
+              flush=True)
+
+        bsgs = pb.BSGSPlan()
+        bsgs.baby.extend(int(x) for x in baby)
+        bsgs.giant.extend(int(x) for x in giant)
+
+        # —— Blocks：优先 mmap，其次 base64 diag_plaintexts —— 
+        blocks_msg: List[pb.DiagBlock] = []
+        total_diag_pts = 0
+
+        diag = j.get("diag_blocks") or j.get("blocks") or {}
+        blocks_in = diag.get("blocks", []) if isinstance(diag, dict) else []
+
+        for idx, blk_in in enumerate(blocks_in):
+            ly = blk_in.get("layout", {}) or {}
+            layout = pb.DiagLayout(
+                slots=safe_int(ly.get("slots", 4096), 4096),
+                stride=safe_int(ly.get("stride", 4096), 4096),
+                diag_offsets=[],  # ★ 会在读取成功后填入
+                packing=ly.get("packing", "offset-major"),
+                poly_modulus_degree=safe_int(ly.get("poly_modulus_degree", 8192), 8192),
+                scale=safe_float(ly.get("scale", scale), scale),
+                level=safe_int(ly.get("level", 0), 0),
+            )
+
+            pts: List[bytes] = []
+            used_source = "none"
+
+            # 1) mmap_path 优先 —— 但先强制覆盖路径，使其根据当前 MODE 选择正确的目录
+            mmap_path = blk_in.get("mmap_path")
+            if mmap_path:
+                # 只保留文件名，避免使用 image/xxx 路径
+                fname = os.path.basename(mmap_path)
+                # 改写 mmap_path，让 _read_diag_pack 自动在 DIAG_ROOT 下寻找文件
+                blk_in["mmap_path"] = fname
+
+                # 覆盖后重新取出 mmap_path
+                mmap_path = blk_in.get("mmap_path")
+
+            if mmap_path:
+                try:
+                    full_path = os.path.join(os.environ["DIAG_ROOT"], mmap_path)
+                    pts = _read_diag_pack(mmap_path)  # 期望得到 128 条
+                    used_source = f"mmap:{full_path}"
+                    start = _infer_block_start(blk_in, mmap_path, idx)
+                    layout.diag_offsets.extend(list(range(start, start + len(pts))))
+                except Exception as e:
+                    print(f"[he_http_adapter] bad_diag_mmap block={idx} error={e}", flush=True)
+                    return jsonify({"error":"bad_diag_mmap", "block": idx, "details": str(e)}), 400
+
+            # 2) 退回 base64 diag_plaintexts（也要补 offsets）
+            if not pts and blk_in.get("diag_plaintexts"):
+                used_source = "inline_base64"
+                raw_list = blk_in.get("diag_plaintexts", [])
+                for p in raw_list:
+                    pts.append(b64d(p))
+                start = _infer_block_start(blk_in, "", idx)
+                layout.diag_offsets.extend(list(range(start, start + len(pts))))
+
+            total_diag_pts += len(pts)
+            blk_msg = pb.DiagBlock(
+                block_id=blk_in.get("block_id",""),
+                snapshot_id=blk_in.get("snapshot_id",""),
+                layout=layout,
+                diag_plaintexts=pts
+            )
+            blocks_msg.append(blk_msg)
+
+            print(f"[he_http_adapter] block#{idx} id={blk_in.get('block_id','')} "
+                  f"slots={layout.slots} stride={layout.stride} polyN={layout.poly_modulus_degree} "
+                  f"diag_cnt={len(pts)} src={used_source}", flush=True)
+
+        print(f"[he_http_adapter] total blocks={len(blocks_msg)} total_diag_pts={total_diag_pts}", flush=True)
+                # ---- 自动保存完整 slot_ids.json（所有 block 拼接）----
+        try:
+            slot_ids_all = []
+            for blk in blocks_in:
+                ids = blk.get("slot_ids", [])
+                if isinstance(ids, list):
+                    slot_ids_all.extend(ids)
+
+            if slot_ids_all:
+                with open("slot_ids.json", "w") as f:
+                    json.dump(slot_ids_all, f)
+                print(f"[he_http_adapter] saved slot_ids.json ({len(slot_ids_all)} slots)", flush=True)
+            else:
+                print("[he_http_adapter] no slot_ids found to save", flush=True)
+
+        except Exception as e:
+            print(f"[he_http_adapter] failed to save slot_ids.json: {e}", flush=True)
+
+        # —— 输出参数（仅透传） —— 
+        out_ct_count = safe_int(j.get("out_ct_count", os.getenv("HE_OUT_CT_COUNT", 8)), 8)
+        out_ct_bytes = safe_int(j.get("out_ct_bytes", os.getenv("HE_OUT_CT_BYTES", 16384)), 16384)
+        pack_slots   = safe_int(j.get("pack_slots",   os.getenv("HE_PACK_SLOTS", 4096)), 4096)
+
+        # —— gRPC —— 
+        try:
+            grpc.channel_ready_future(channel).result(timeout=3)
+            req = pb.ScoreBatchRequest(
+                client_id=client_id,
+                key_ver=key_ver,
+                ct_q=ct_q_bytes,
+                bsgs=bsgs,
+                blocks=blocks_msg,
+                scale=scale,
+                out_ct_count=out_ct_count,
+                out_ct_bytes=out_ct_bytes,
+                pack_slots=pack_slots,
+            )
+            rep = stub.ScoreBatch(req, timeout=120, wait_for_ready=True)
+
+            # 直接回传 gRPC 返回的密文（base64）
+            blobs = [b64e(x) for x in rep.scores_ciphertexts]
+            body = {
+                "packed_scores": blobs,
+                "packShapes": [{"batch": s.batch, "slots": s.slots} for s in rep.pack_shapes],
+                "telemetry": {
+                    "lat_us": getattr(rep.telemetry, "lat_us", 0),
+                    "rot_cnt": getattr(rep.telemetry, "rot_cnt", 0),
+                    "mul_cnt": getattr(rep.telemetry, "mul_cnt", 0),
+                }
+            }
+            print(f"[he_http_adapter] ScoreBatch -> ok blocks={len(blocks_msg)} out_n={len(blobs)}", flush=True)
+            return jsonify(body)
+
+        except grpc.RpcError as e:
+            status = e.code().name if hasattr(e, "code") else "UNKNOWN"
+            details = e.details() if hasattr(e, "details") else str(e)
+            print(f"[he_http_adapter] ScoreBatch RPC error: status={status} details={details}", flush=True)
+            return jsonify({"error":"grpc_failed","status":status,"details":details}), 500
+
+    return app
+
+# ---------------- main ----------------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--grpc", default="127.0.0.1:18082", help="HeCompute gRPC address")
+    ap.add_argument("--port", type=int, default=18083, help="HTTP listen port")
+    args = ap.parse_args()
+
+    app = create_app(args.grpc)
+    app.run(host="0.0.0.0", port=args.port)

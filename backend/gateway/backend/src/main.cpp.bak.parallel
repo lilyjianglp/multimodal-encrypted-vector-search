@@ -1,0 +1,634 @@
+#include <grpcpp/grpcpp.h>
+#include "gateway.grpc.pb.h"
+
+#include <chrono>
+#include <thread>
+#include <random>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <memory>
+#include <cstdlib>
+#include <cstdint>
+#include <fstream>
+#include <cstring>
+#include <csignal>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
+
+#include <curl/curl.h>
+#include "third_party_json.hpp"           // 放在工程根目录
+using json = nlohmann::json;
+
+using grpc::Server;
+using grpc::ServerBuilder;
+using grpc::ServerContext;
+using grpc::Status;
+using gateway::v1::GatewayService;
+using gateway::v1::SearchRequest;
+using gateway::v1::SearchResponse;
+using gateway::v1::PackShape;
+
+// -------------------- 配置与环境 --------------------
+static std::string g_index_base = "http://127.0.0.1:18081";
+static std::string g_he_base    = "http://127.0.0.1:18082";
+static std::string g_cfg_file;
+
+static int  ENV_L()         { const char* v=getenv("GATEWAY_L");     return v?std::stoi(v):8; }
+static int  ENV_R()         { const char* v=getenv("GATEWAY_R");     return v?std::stoi(v):512; }
+static int  ENV_CTBYTES()   { const char* v=getenv("CT_BYTES");      return v?std::stoi(v):16384; }
+static int  ENV_SLOTS()     { const char* v=getenv("PACK_SLOTS");    return v?std::stoi(v):4096; }
+static int  ENV_P95MS()     { const char* v=getenv("P95_MS");        return v?std::stoi(v):120; }
+static int  ENV_JITTER()    { const char* v=getenv("JITTER_MS");     return v?std::stoi(v):15; }
+static int  ENV_OUTCOUNT()  { const char* v=getenv("OUT_CT_COUNT");  return v?std::stoi(v):8; }
+
+// HTTP 重试控制
+static int  ENV_RETRY_N()   { const char* v=getenv("HTTP_RETRY_N");  return v?std::stoi(v):2; }
+static int  ENV_RETRY_MS()  { const char* v=getenv("HTTP_RETRY_MS"); return v?std::stoi(v):120; }
+static int  ENV_RJITTER()   { const char* v=getenv("RETRY_JITTER");  return v?std::stoi(v):30; }
+
+// 限流
+static double ENV_G_QPS(){ const char* v=getenv("RATE_GLOBAL_QPS"); return v?std::stod(v):50.0; }
+static double ENV_S_QPS(){ const char* v=getenv("RATE_SESSION_QPS");return v?std::stod(v):5.0; }
+static double ENV_BURST(){ const char* v=getenv("RATE_BURST");      return v?std::stod(v):2.0; }
+
+// 配额（按会话，每小时）
+static int ENV_Q_SESSION_H(){ const char* v=getenv("QUOTA_SESSION_PER_H"); return v?std::stoi(v):1000; }
+
+// 熔断
+static int ENV_CB_FAILS(){ const char* v=getenv("CB_FAILS"); return v?std::stoi(v):5; }
+static int ENV_CB_OPEN_MS(){ const char* v=getenv("CB_OPEN_MS"); return v?std::stoi(v):2000; }
+
+// 伪查询策略
+static std::vector<double> g_center_weights;
+static std::string ENV_FAKE_POLICY(){ const char* v=getenv("FAKE_POLICY"); return v?std::string(v):"uniform"; }
+
+// -------------------- 配置加载 / 验证 / 热更 --------------------
+static void load_config(const char* path) {
+  try {
+    std::ifstream ifs(path);
+    if (!ifs) { std::cerr << "[Gateway] config not found: " << path << "\n"; return; }
+    json cfg = json::parse(ifs);
+
+    if (cfg.contains("services")) {
+      auto s = cfg["services"];
+      if (s.contains("index_base")) g_index_base = s["index_base"].get<std::string>();
+      if (s.contains("he_base"))    g_he_base    = s["he_base"].get<std::string>();
+    }
+    if (cfg.contains("gateway")) {
+      auto g = cfg["gateway"];
+      auto seti = [&](const char* env, const char* k){
+        if (g.contains(k)) setenv(env, std::to_string(g[k].get<int>()).c_str(), 1);
+      };
+      if (g.contains("listen")) setenv("GATEWAY_LISTEN", g["listen"].get<std::string>().c_str(), 1);
+      seti("GATEWAY_L","L"); seti("GATEWAY_R","R"); seti("CT_BYTES","ct_bytes");
+      seti("PACK_SLOTS","pack_slots"); seti("P95_MS","p95_ms"); seti("JITTER_MS","jitter_ms");
+      seti("OUT_CT_COUNT","out_ct_count"); seti("HTTP_RETRY_N","http_retry_n");
+      seti("HTTP_RETRY_MS","http_retry_ms"); seti("RETRY_JITTER","http_retry_jitter");
+      if (g.contains("rate_global_qps")) setenv("RATE_GLOBAL_QPS", std::to_string(g["rate_global_qps"].get<int>()).c_str(), 1);
+      if (g.contains("rate_session_qps"))setenv("RATE_SESSION_QPS",std::to_string(g["rate_session_qps"].get<int>()).c_str(), 1);
+      if (g.contains("rate_burst"))      setenv("RATE_BURST",      std::to_string(g["rate_burst"].get<int>()).c_str(), 1);
+
+      if (g.contains("fake_policy")) setenv("FAKE_POLICY", g["fake_policy"].get<std::string>().c_str(), 1);
+      if (g.contains("center_weights") && g["center_weights"].is_array()) {
+        g_center_weights.clear(); for (auto& w : g["center_weights"]) g_center_weights.push_back(w.get<double>());
+      }
+      if (g.contains("quota_session_per_h")) setenv("QUOTA_SESSION_PER_H", std::to_string(g["quota_session_per_h"].get<int>()).c_str(), 1);
+
+      if (g.contains("cb_fails")) setenv("CB_FAILS", std::to_string(g["cb_fails"].get<int>()).c_str(), 1);
+      if (g.contains("cb_open_ms")) setenv("CB_OPEN_MS", std::to_string(g["cb_open_ms"].get<int>()).c_str(), 1);
+    }
+    std::cerr << "[Gateway] loaded config: " << path << "\n";
+  } catch (const std::exception& e) {
+    std::cerr << "[Gateway] load_config error: " << e.what() << "\n";
+  }
+}
+
+static void validate_config() {
+  auto bound_i = [](int v, int lo, int hi, const char* k, int defv){
+    if (v<lo || v>hi){ std::cerr<<"[Config] Invalid "<<k<<": "<<v<<", reset to "<<defv<<"\n"; return defv; }
+    return v;
+  };
+  auto bound_f = [](double v, double lo, double hi, const char* k, double defv){
+    if (!(v==v) || v<lo || v>hi){ std::cerr<<"[Config] Invalid "<<k<<": "<<v<<", reset to "<<defv<<"\n"; return defv; }
+    return v;
+  };
+
+  setenv("GATEWAY_L",     std::to_string(bound_i(ENV_L(),1,1000,"GATEWAY_L",8)).c_str(),1);
+  setenv("GATEWAY_R",     std::to_string(bound_i(ENV_R(),1,10000,"GATEWAY_R",512)).c_str(),1);
+  setenv("CT_BYTES",      std::to_string(bound_i(ENV_CTBYTES(),1,1000000,"CT_BYTES",16384)).c_str(),1);
+  setenv("PACK_SLOTS",    std::to_string(bound_i(ENV_SLOTS(),1,100000,"PACK_SLOTS",4096)).c_str(),1);
+  setenv("P95_MS",        std::to_string(bound_i(ENV_P95MS(),0,60000,"P95_MS",120)).c_str(),1);
+  setenv("JITTER_MS",     std::to_string(bound_i(ENV_JITTER(),0,10000,"JITTER_MS",15)).c_str(),1);
+  setenv("OUT_CT_COUNT",  std::to_string(bound_i(ENV_OUTCOUNT(),1,1000,"OUT_CT_COUNT",8)).c_str(),1);
+  setenv("HTTP_RETRY_N",  std::to_string(bound_i(ENV_RETRY_N(),0,10,"HTTP_RETRY_N",2)).c_str(),1);
+  setenv("HTTP_RETRY_MS", std::to_string(bound_i(ENV_RETRY_MS(),1,60000,"HTTP_RETRY_MS",120)).c_str(),1);
+  setenv("RETRY_JITTER",  std::to_string(bound_i(ENV_RJITTER(),0,60000,"RETRY_JITTER",30)).c_str(),1);
+  setenv("RATE_GLOBAL_QPS", std::to_string(bound_f(ENV_G_QPS(),0.001,100000.0,"RATE_GLOBAL_QPS",50.0)).c_str(),1);
+  setenv("RATE_SESSION_QPS",std::to_string(bound_f(ENV_S_QPS(),0.001,10000.0,"RATE_SESSION_QPS",5.0)).c_str(),1);
+  setenv("RATE_BURST",     std::to_string(bound_f(ENV_BURST(),0.1,1000.0,"RATE_BURST",2.0)).c_str(),1);
+  setenv("QUOTA_SESSION_PER_H", std::to_string(bound_i(ENV_Q_SESSION_H(),1,1000000,"QUOTA_SESSION_PER_H",1000)).c_str(),1);
+  setenv("CB_FAILS",     std::to_string(bound_i(ENV_CB_FAILS(),1,100,"CB_FAILS",5)).c_str(),1);
+  setenv("CB_OPEN_MS",   std::to_string(bound_i(ENV_CB_OPEN_MS(),1,60000,"CB_OPEN_MS",2000)).c_str(),1);
+
+  std::string policy = ENV_FAKE_POLICY();
+  if (policy!="uniform" && policy!="dist_sim"){ std::cerr<<"[Config] Invalid FAKE_POLICY: "<<policy<<", reset to uniform\n"; setenv("FAKE_POLICY","uniform",1); }
+
+  if (g_index_base.empty() || g_index_base.find("http")!=0){ std::cerr<<"[Config] Invalid index_base, reset\n"; g_index_base="http://127.0.0.1:18081"; }
+  if (g_he_base.empty() || g_he_base.find("http")!=0){ std::cerr<<"[Config] Invalid he_base, reset\n"; g_he_base="http://127.0.0.1:18082"; }
+
+  std::cerr << "[Config] Validation completed\n";
+}
+
+static void hup_handler(int){
+  if (!g_cfg_file.empty()) {
+    std::cerr << "[Gateway] SIGHUP: reload config\n";
+    load_config(g_cfg_file.c_str());
+    validate_config();
+  }
+}
+
+// -------------------- Base64 解码（纯 C++） --------------------
+static std::string b64decode(const std::string& in) {
+  static int8_t T[256]; static bool inited = false;
+  if (!inited) {
+    for (int i=0;i<256;i++) T[i] = -1;
+    T['\t']=T['\n']=T['\r']=T[' ']=-2;
+    for (int c='A'; c<='Z'; ++c) T[c] = c - 'A';
+    for (int c='a'; c<='z'; ++c) T[c] = c - 'a' + 26;
+    for (int c='0'; c<='9'; ++c) T[c] = c - '0' + 52;
+    T['+'] = 62; T['/'] = 63; T['='] = 0;
+    inited = true;
+  }
+  std::string out; out.reserve(in.size()*3/4 + 3);
+  int val=0, valb=-8;
+  for (unsigned char c : in) {
+    int8_t d = T[c];
+    if (d == -2) continue;
+    if (d == -1) { if (c=='=') break; else continue; }
+    val = (val<<6) + d; valb += 6;
+    if (valb >= 0) { out.push_back(char((val>>valb)&0xFF)); valb -= 8; }
+  }
+  return out;
+}
+
+// -------------------- HTTP helpers + 重试 --------------------
+static size_t wrfunc(void* in, size_t sz, size_t nm, void* out) {
+  auto* s = reinterpret_cast<std::string*>(out);
+  size_t total = sz * nm; s->append(reinterpret_cast<char*>(in), total); return total;
+}
+
+static bool http_get_json(const std::string& url, json& out) {
+  CURL* c = curl_easy_init(); if (!c) return false;
+  std::string buf;
+  curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 5L);
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wrfunc);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &buf);
+  auto rc = curl_easy_perform(c);
+  long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+  curl_easy_cleanup(c);
+  if (rc != CURLE_OK || code != 200) return false;
+  try { out = json::parse(buf); return true; } catch (...) { return false; }
+}
+
+static bool http_post_json(const std::string& url, const json& body, json& out) {
+  CURL* c = curl_easy_init(); if (!c) return false;
+  std::string buf; auto s = body.dump();
+  struct curl_slist* headers = nullptr;
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(c, CURLOPT_POST, 1L);
+  curl_easy_setopt(c, CURLOPT_POSTFIELDS, s.c_str());
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wrfunc);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &buf);
+  auto rc = curl_easy_perform(c);
+  long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+  curl_slist_free_all(headers); curl_easy_cleanup(c);
+  if (rc != CURLE_OK || code != 200) return false;
+  try { out = json::parse(buf); return true; } catch (...) { return false; }
+}
+
+static void sleep_ms(int ms){ if(ms>0) std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+static int backoff_ms(int attempt, int base, int jitter){
+  long ms = long(base) * (1L<<attempt);
+  if (jitter>0) ms += rand() % jitter;
+  return (int)ms;
+}
+
+static bool http_get_json_retry(const std::string& url, json& out, int& retries, long& ms_spent){
+  int N = ENV_RETRY_N(), base = ENV_RETRY_MS(), jit = ENV_RJITTER(); auto t0=std::chrono::steady_clock::now();
+  for(int i=0;i<=N;i++){
+    if (http_get_json(url, out)) { retries=i; ms_spent=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count(); return true; }
+    if (i<N){ int ms=backoff_ms(i,base,jit); std::cerr<<"[Gateway] GET retry "<<(i+1)<<" in "<<ms<<"ms "<<url<<"\n"; sleep_ms(ms); }
+  }
+  retries=N+1; ms_spent=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count(); return false;
+}
+
+static bool http_post_json_retry(const std::string& url, const json& body, json& out, int& retries, long& ms_spent){
+  int N = ENV_RETRY_N(), base = ENV_RETRY_MS(), jit = ENV_RJITTER(); auto t0=std::chrono::steady_clock::now();
+  for(int i=0;i<=N;i++){
+    if (http_post_json(url, body, out)) { retries=i; ms_spent=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count(); return true; }
+    if (i<N){ int ms=backoff_ms(i,base,jit); std::cerr<<"[Gateway] POST retry "<<(i+1)<<" in "<<ms<<"ms "<<url<<"\n"; sleep_ms(ms); }
+  }
+  retries=N+1; ms_spent=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count(); return false;
+}
+
+// -------------------- 限流（全局+会话） --------------------
+struct TokenBucket {
+  double tokens{1}, rate{1}, burst{1};
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  bool allow() {
+    auto now = std::chrono::steady_clock::now();
+    double dt = std::chrono::duration<double>(now - last).count();
+    last = now; tokens = std::min(burst, tokens + dt * rate);
+    if (tokens >= 1.0) { tokens -= 1.0; return true; }
+    return false;
+  }
+};
+static TokenBucket g_bucket;
+static std::unordered_map<std::string, TokenBucket> g_sbuckets;
+static std::mutex g_mu;
+static bool rate_allow(const std::string& sid, double gr, double sr, double burst) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_bucket.rate = gr; g_bucket.burst = burst;
+  auto& tb = g_sbuckets[sid]; tb.rate = sr; tb.burst = burst;
+  return g_bucket.allow() && tb.allow();
+}
+
+// -------------------- 会话配额（每小时） --------------------
+struct Quota { int used{0}; std::chrono::steady_clock::time_point win_start{std::chrono::steady_clock::now()}; };
+static std::unordered_map<std::string, Quota> g_quota_map;
+static std::mutex g_quota_mutex;
+
+static bool quota_check(const std::string& session_id) {
+  std::lock_guard<std::mutex> lock(g_quota_mutex);
+  auto& q = g_quota_map[session_id];
+  auto now = std::chrono::steady_clock::now();
+  if (std::chrono::duration_cast<std::chrono::hours>(now - q.win_start).count() >= 1) {
+    q.used = 0; q.win_start = now;
+  }
+  if (q.used >= ENV_Q_SESSION_H()) return false;
+  q.used++; return true;
+}
+
+// -------------------- 熔断器 --------------------
+struct CircuitBreaker {
+  std::atomic<int> fail_count{0};
+  std::atomic<bool> is_open{false};
+  std::chrono::steady_clock::time_point open_until;
+  std::mutex state_mutex;
+};
+static CircuitBreaker g_cb;
+
+static bool circuit_breaker_allow() {
+  if (!g_cb.is_open.load()) return true;
+  auto now = std::chrono::steady_clock::now();
+  if (now >= g_cb.open_until) {
+    std::lock_guard<std::mutex> lk(g_cb.state_mutex);
+    if (now >= g_cb.open_until) {
+      g_cb.is_open = false; g_cb.fail_count = 0;
+      std::cerr << "[CircuitBreaker] half-open\n";
+      return true;
+    }
+  }
+  return false;
+}
+static void circuit_breaker_on_success(){ std::lock_guard<std::mutex> lk(g_cb.state_mutex); g_cb.fail_count=0; g_cb.is_open=false; }
+static void circuit_breaker_on_failure(){
+  std::lock_guard<std::mutex> lk(g_cb.state_mutex);
+  if (++g_cb.fail_count >= ENV_CB_FAILS() && !g_cb.is_open) {
+    g_cb.is_open = true;
+    g_cb.open_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ENV_CB_OPEN_MS());
+    std::cerr << "[CircuitBreaker] OPEN "<<ENV_CB_OPEN_MS()<<"ms\n";
+  }
+}
+
+// -------------------- A：候选 + 对角块 --------------------
+static bool call_index_A(const std::vector<std::string>& clusters, uint32_t R, json& out_diag_blocks,
+                         int& http_retries_a, long& http_ms_a, std::string& err_tag) {
+  out_diag_blocks = json::array();
+  bool ok = true; http_retries_a=0; http_ms_a=0;
+
+  json all_candidate_ids = json::array();
+  for (const auto& cid : clusters) {
+    json j; int r=0; long ms=0;
+    std::string url = g_index_base + "/clusters/" + cid + "/candidates?top=" + std::to_string(R);
+    if (!http_get_json_retry(url, j, r, ms)) { ok=false; err_tag="A_candidates"; j = json::object(); j["candidate_ids"]=json::array(); }
+    http_retries_a += r; http_ms_a += ms;
+
+    std::vector<std::string> ids;
+    if (j.contains("candidate_ids") && j["candidate_ids"].is_array())
+      for (auto& v : j["candidate_ids"]) ids.push_back(v.get<std::string>());
+    while (ids.size() < R) ids.push_back("dummy");
+    if (ids.size() > R) ids.resize(R);
+    for (auto& s : ids) all_candidate_ids.push_back(s);
+  }
+
+  json req_body = json::object({{"candidate_ids", all_candidate_ids}});
+  json jr; int r=0; long ms=0;
+  if (!http_post_json_retry(g_index_base + "/diag-blocks", req_body, jr, r, ms)) {
+    ok = false; err_tag = err_tag.empty()?"A_diag_blocks":err_tag;
+  } else {
+    out_diag_blocks = jr;
+  }
+  http_retries_a += r; http_ms_a += ms;
+  return ok;
+}
+
+// -------------------- B：同态打分 + 恒定化打包 --------------------
+static bool call_he_B_and_pack(const SearchRequest& req, SearchResponse* resp,
+                               const std::vector<std::string>& clusters, const json& diag_blocks,
+                               int& http_retries_b, long& http_ms_b, std::string& err_tag) {
+  (void)clusters;
+  const int out_n  = ENV_OUTCOUNT();
+  const int ct_sz  = ENV_CTBYTES();
+  const uint32_t slots = (uint32_t)ENV_SLOTS();
+
+  json jreq = {
+    {"client_id","gw"},
+    {"key_ver",  req.key_ver()},
+    {"ct_q",     ""}, // mock 不校验；对接真实 B 时可传 req.ct_q() 的 base64
+    {"diag_blocks", diag_blocks},
+    {"bsgs_plan", {{"giant", json::array()}, {"baby", json::array()}}},
+    {"scale",    req.scale()},
+    {"mod_chain", json::array({"Q0","Q1","Q2"})}
+  };
+
+  json jr; int r=0; long ms=0;
+  bool ok = http_post_json_retry(g_he_base + "/score/batch", jreq, jr, r, ms);
+  http_retries_b = r; http_ms_b = ms;
+
+  int got=0;
+  if (ok && jr.contains("packed_scores") && jr["packed_scores"].is_array()) {
+    for (auto& v : jr["packed_scores"]) {
+      std::string dec = b64decode(v.get<std::string>());
+      if ((int)dec.size() < ct_sz) dec.append(ct_sz - (int)dec.size(), '\0');
+      else if ((int)dec.size() > ct_sz) dec.resize(ct_sz);
+      resp->add_scores_ciphertexts(dec);
+      auto* s = resp->add_pack_shapes(); s->set_batch(1); s->set_slots(slots);
+      if (++got == out_n) break;
+    }
+  } else {
+    err_tag = err_tag.empty()?"B_score":err_tag;
+  }
+  for (; got < out_n; ++got) { // 不足补齐
+    resp->add_scores_ciphertexts(std::string(ct_sz, '\0'));
+    auto* s = resp->add_pack_shapes(); s->set_batch(1); s->set_slots(slots);
+  }
+  return ok;
+}
+
+// -------------------- 健康探针与 eval-keys 代理（HTTP:127.0.0.1:8080） --------------------
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+static void http_send(int fd, int code, const std::string& body){
+  char head[256];
+  int n = snprintf(head, sizeof(head),
+    "HTTP/1.1 %d %s\r\n"
+    "Content-Type: application/json\r\n"
+    "Content-Length: %zu\r\n"
+    "Connection: close\r\n\r\n",
+    code, (code==200?"OK":"Service Unavailable"), body.size());
+  send(fd, head, n, 0); if(!body.empty()) send(fd, body.data(), body.size(), 0);
+}
+
+static bool readiness_check(){
+  try{
+    // 轻探 B：空任务
+    json jb, body = { {"packed_scores", json::array()} };
+    int r=0; long ms=0;
+    if (!http_post_json_retry(g_he_base + "/score/batch", body, jb, r, ms)) return false;
+    return true;
+  }catch(...){ return false; }
+}
+
+static bool proxy_eval_keys(const std::string& body, std::string& out){
+  try{
+    json in = json::parse(body), resp;
+    int r=0; long ms=0;
+    if (!http_post_json_retry(g_he_base + "/eval-keys", in, resp, r, ms)) {
+      json m = {{"event","eval_keys_error"}, {"http_retries", r}};
+      std::cout << m.dump() << std::endl;
+      return false;
+    }
+    out = resp.dump();
+    json m = {{"event","eval_keys"}, {"http_retries", r}, {"http_ms", ms}};
+    std::cout << m.dump() << std::endl;
+    return true;
+  }catch(...){
+    json m = {{"event","eval_keys_parse_error"}};
+    std::cout << m.dump() << std::endl;
+    return false;
+  }
+}
+
+static ssize_t find_header_end(const char* buf, ssize_t n){
+  for (ssize_t i=0;i+3<n;i++) if (buf[i]=='\r'&&buf[i+1]=='\n'&&buf[i+2]=='\r'&&buf[i+3]=='\n') return i+4;
+  return -1;
+}
+
+static void healthz_thread(){
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  int on=1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  sockaddr_in a{}; a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK); a.sin_port=htons(8080);
+  bind(s,(sockaddr*)&a,sizeof(a)); listen(s,8);
+  std::cerr << "[Gateway] health server 127.0.0.1:8080\n";
+
+  while (true){
+    int c=accept(s,nullptr,nullptr); if(c<0) continue;
+
+    char buf[4096]; int n = recv(c, buf, sizeof(buf)-1, 0);
+    if (n<=0){ close(c); continue; } buf[n]='\0';
+
+    char* crlf = strstr(buf, "\r\n");
+    size_t linelen = crlf ? (size_t)(crlf - buf) : strlen(buf);
+    std::string first(buf, linelen);
+    size_t sp1 = first.find(' '), sp2 = (sp1==std::string::npos)?std::string::npos:first.find(' ', sp1+1);
+    std::string method = (sp1!=std::string::npos)? first.substr(0, sp1):"";
+    std::string path   = (sp1!=std::string::npos && sp2!=std::string::npos)? first.substr(sp1+1, sp2-(sp1+1)):"";
+
+    if (method=="GET" && path=="/healthz") { http_send(c,200,"\"ok\""); close(c); continue; }
+    if (method=="GET" && path=="/readyz")  { bool ok = readiness_check(); http_send(c, ok?200:503, ok?"\"ready\"":"\"not ready\""); close(c); continue; }
+    if (method=="POST" && path=="/eval-keys") {
+      ssize_t head_end = find_header_end(buf, n);
+      if (head_end<0){ http_send(c,400,"\"bad header\""); close(c); continue; }
+      std::string headers(buf, head_end);
+      size_t pos = headers.find("Content-Length:");
+      if (pos==std::string::npos){ http_send(c,411,"\"length required\""); close(c); continue; }
+      size_t end = headers.find("\r\n", pos);
+      std::string v = headers.substr(pos+15, end-pos-15);
+      int clen = std::stoi(v);
+      std::string body;
+      body.assign(buf+head_end, std::min<int>(clen, n - head_end));
+      while ((int)body.size() < clen) { char tmp[4096]; int m = recv(c, tmp, sizeof(tmp), 0); if (m<=0) break; body.append(tmp, tmp+m); }
+      std::string out;
+      if (proxy_eval_keys(body, out)) http_send(c,200, out.empty()?"\"ok\"":out);
+      else http_send(c,500,"\"proxy failed\"");
+      close(c); continue;
+    }
+    http_send(c,404,"\"not found\""); close(c);
+  }
+}
+
+// -------------------- Gateway 实现 --------------------
+class GatewayServiceImpl final : public GatewayService::Service {
+  Status Search(ServerContext* /*ctx*/, const SearchRequest* req, SearchResponse* resp) override {
+    auto t0 = std::chrono::steady_clock::now();
+    const int L = ENV_L();
+    const int P95 = ENV_P95MS();
+    const int JIT = ENV_JITTER();
+
+    // 配额
+    if (!quota_check(req->session_id())) {
+      const int out_n=ENV_OUTCOUNT(), ct_sz=ENV_CTBYTES(); const uint32_t slots=(uint32_t)ENV_SLOTS();
+      for (int i=0;i<out_n;i++){ resp->add_scores_ciphertexts(std::string(ct_sz,'\0')); auto* s=resp->add_pack_shapes(); s->set_batch(1); s->set_slots(slots); }
+      if (P95>0) std::this_thread::sleep_for(std::chrono::milliseconds(P95));
+      if (JIT>0) std::this_thread::sleep_for(std::chrono::milliseconds(rand()%JIT));
+      resp->set_latency_ms(P95 + (JIT?rand()%JIT:0));
+      json m = {{"event","search"}, {"quota_exceeded",1}};
+      std::cout << m.dump() << std::endl;
+      return Status::OK;
+    }
+
+    // 限流（超限 → 恒定化占位）
+    bool rateLimited=false;
+    if (!rate_allow(req->session_id(), ENV_G_QPS(), ENV_S_QPS(), ENV_BURST())) {
+      rateLimited=true;
+      const int out_n=ENV_OUTCOUNT(), ct_sz=ENV_CTBYTES(); const uint32_t slots=(uint32_t)ENV_SLOTS();
+      for (int i=0;i<out_n;i++){ resp->add_scores_ciphertexts(std::string(ct_sz,'\0')); auto* s=resp->add_pack_shapes(); s->set_batch(1); s->set_slots(slots); }
+      if (P95>0) std::this_thread::sleep_for(std::chrono::milliseconds(P95));
+      if (JIT>0) std::this_thread::sleep_for(std::chrono::milliseconds(rand()%JIT));
+      resp->set_latency_ms(P95 + (JIT?rand()%JIT:0));
+      json m = {{"event","search"}, {"rate_limited",1}};
+      std::cout << m.dump() << std::endl;
+      return Status::OK;
+    }
+
+// 固定 L：不足补假簇；过多截断
+std::vector<std::string> clusters(req->cluster_ids().begin(), req->cluster_ids().end());
+if ((int)clusters.size() < L) {
+    uint64_t seed = 0;
+    for (auto ch : req->session_id()) seed = seed * 131 + (unsigned char)ch;
+    std::mt19937_64 rng(seed ? seed : 0xBADC0DE);
+    int need = L - (int)clusters.size();
+    std::string policy = ENV_FAKE_POLICY();
+    if (policy == "dist_sim" && !g_center_weights.empty()) {
+        std::discrete_distribution<int> dist(g_center_weights.begin(), g_center_weights.end());
+        for (int i = 0; i < need; i++)
+            clusters.push_back("fake_center_" + std::to_string(dist(rng)));
+    } else {
+        for (int i = 0; i < need; i++)
+            clusters.push_back("fake_" + std::to_string(rng() % 1000000));
+    }
+} else if ((int)clusters.size() > L) {
+    clusters.resize(L);
+}
+
+// ---------- 新增：日志打点 ----------
+int origL = req->cluster_ids_size();
+int usedL = (int)clusters.size();
+json m_pre = {
+    {"event", "search_plan"},
+    {"L_orig", origL},
+    {"L_used", usedL},
+    {"policy", ENV_FAKE_POLICY()}
+};
+std::cout << m_pre.dump() << std::endl;
+// ----------------------------------
+
+// A：候选 + 块
+json diag_blocks;
+int rA = 0, rB = 0;
+long msA = 0, msB = 0;
+std::string err_tag;
+uint32_t R = (uint32_t)ENV_R();  // 固定 R，避免侧信道
+(void)call_index_A(clusters, R, diag_blocks, rA, msA, err_tag);
+
+// 熔断 + B：打分
+bool okB = false;
+std::string err_tag_b;
+if (!circuit_breaker_allow()) {
+    okB = false;
+    err_tag = "circuit_open";
+    json m = {{"event", "circuit_breaker_open"}};
+    std::cout << m.dump() << std::endl;
+    // 也要补齐占位
+    const int out_n = ENV_OUTCOUNT(), ct_sz = ENV_CTBYTES();
+    const uint32_t slots = (uint32_t)ENV_SLOTS();
+    for (int i = 0; i < out_n; i++) {
+        resp->add_scores_ciphertexts(std::string(ct_sz, '\0'));
+        auto* s = resp->add_pack_shapes();
+        s->set_batch(1);
+        s->set_slots(slots);
+    }
+} else {
+    okB = call_he_B_and_pack(*req, resp, clusters, diag_blocks, rB, msB, err_tag_b);
+    if (okB)
+        circuit_breaker_on_success();
+    else {
+        circuit_breaker_on_failure();
+        if (!err_tag.empty()) err_tag += ",";
+        err_tag += err_tag_b;
+    }
+}
+
+
+    // 时间恒定化
+    auto t1 = std::chrono::steady_clock::now();
+    auto used = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    if (used < P95) std::this_thread::sleep_for(std::chrono::milliseconds(P95 - used));
+    if (JIT > 0)   std::this_thread::sleep_for(std::chrono::milliseconds(rand()%JIT));
+    auto t2 = std::chrono::steady_clock::now();
+    uint32_t total_ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t0).count();
+    resp->set_latency_ms(total_ms);
+
+    // 指标日志
+    json m = {
+      {"event","search"},
+      {"latency_ms", total_ms},
+      {"http_retries_a", rA}, {"http_ms_a", msA},
+      {"http_retries_b", rB}, {"http_ms_b", msB},
+      {"rate_limited", rateLimited?1:0},
+      {"quota_exceeded", 0}
+    };
+    if (!err_tag.empty()) m["err"]=err_tag;
+    std::cout << m.dump() << std::endl;
+
+    return Status::OK;
+  }
+};
+
+// -------------------- main --------------------
+int main(int argc, char** argv) {
+  for (int i=1;i<argc;i++) if (std::string(argv[i])=="-c" && i+1<argc) g_cfg_file = argv[++i];
+  if (!g_cfg_file.empty()) load_config(g_cfg_file.c_str());
+  validate_config();
+  signal(SIGHUP, hup_handler);
+
+  std::string addr = getenv("GATEWAY_LISTEN") ? getenv("GATEWAY_LISTEN") : "0.0.0.0:50051";
+  GatewayServiceImpl svc;
+
+  std::thread(healthz_thread).detach();
+
+  ServerBuilder builder;
+  builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
+  builder.RegisterService(&svc);
+  std::unique_ptr<Server> server(builder.BuildAndStart());
+  std::cout << "[Gateway] listening on " << addr
+            << "  L=" << ENV_L() << " R=" << ENV_R()
+            << " ct_bytes=" << ENV_CTBYTES() << " slots=" << ENV_SLOTS()
+            << " p95ms=" << ENV_P95MS() << " jitter=" << ENV_JITTER()
+            << " retryN=" << ENV_RETRY_N() << " retryBaseMs=" << ENV_RETRY_MS()
+            << " retryJitter=" << ENV_RJITTER()
+            << " index=" << g_index_base << " he=" << g_he_base
+            << std::endl;
+  server->Wait();
+  return 0;
+}
+

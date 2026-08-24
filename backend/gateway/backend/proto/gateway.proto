@@ -1,0 +1,25 @@
+syntax = "proto3";
+package gateway.v1;
+
+message SearchRequest {
+  string session_id   = 1;
+  repeated string cluster_ids = 2;  // 真簇+假簇由客户端/网关共同保证 L 固定
+  bytes  ct_q         = 3;          // CKKS 加密后的查询密文（base64->bytes）
+  string key_ver      = 4;          // 例如 v1/v2
+  string fake_policy  = 5;          // "uniform" | "fitted"
+  uint64 scale        = 6;
+  uint32 topR         = 7;          // 每簇候选 R
+  string mode         = 8;
+  
+}
+
+message PackShape { uint32 batch = 1; uint32 slots = 2; }
+
+message SearchResponse {
+  repeated bytes scores_ciphertexts = 1;  // 固定数量、固定字节大小（恒定化）
+  repeated PackShape pack_shapes     = 2; // 固定形状
+  uint32 latency_ms                 = 3;
+}
+service GatewayService {
+  rpc Search (SearchRequest) returns (SearchResponse);
+}

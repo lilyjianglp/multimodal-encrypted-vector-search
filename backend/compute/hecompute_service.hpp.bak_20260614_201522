@@ -1,0 +1,108 @@
+#pragma once
+#include <seal/seal.h>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <chrono>
+Ciphertext DotDiag_BSGS_Cached(
+const Ciphertext& ct_q,
+const DiagBlock& blk,
+const BSGSPlan& bsgs,
+const seal::GaloisKeys& gal_keys,
+seal::Evaluator& evaluator,
+double target_scale,
+const std::unordered_map<int, seal::Ciphertext>& baby_cache,
+int g_step,
+Telemetry& telem);
+
+struct LayoutMeta {
+    std::size_t slots{0};
+    std::size_t stride{1};
+    std::vector<int> diag_offsets; // A 导出：offset-major 顺序
+    std::string packing{"offset-major"};
+    // 可选：校准信息
+    std::size_t poly_modulus_degree{0};
+    double scale{0};
+    int level{-1};
+};
+
+struct DiagBlock {
+    std::string block_id;
+    std::string snapshot_id;
+    std::string mmap_path;               // 这里不强依赖，Demo 用内存喂
+    LayoutMeta layout;
+    // Demo: 对应每个 offset 的明文素材（真实接 A 时请从 mmap 读）
+    std::vector<seal::Plaintext> diag_plaintexts;
+};
+
+struct BSGSPlan {
+    std::vector<int> giant;
+    std::vector<int> baby;
+};
+
+struct ScoreBatchRequest {
+    std::string client_id;
+    std::string key_ver;
+    seal::Ciphertext ct_q;
+    std::vector<DiagBlock> blocks;
+    BSGSPlan bsgs;
+    double scale{0};
+    // mod_chain 留给 SEALContext 自己管理
+};
+
+struct Telemetry {
+    long long lat_us{0};
+    std::size_t rot_cnt{0};
+    std::size_t mul_cnt{0};
+    std::size_t rescale_cnt{0};
+    std::size_t mem_bytes{0};
+    int level{-1};
+};
+
+struct ScoreBatchReply {
+    // 一个 block 对应一个密文打分（或多份），这里先简化为每块一份
+    std::vector<seal::Ciphertext> scores_ciphertexts;
+    std::vector<std::array<std::size_t,2>> pack_shapes; // [batch, slots]
+    Telemetry telemetry;
+    std::string snapshot_id;
+};
+
+class HeComputeService {
+public:
+    explicit HeComputeService(const seal::SEALContext& ctx)
+    : context_(ctx), encoder_(ctx) {}
+
+    // 对应 POST /eval-keys
+    void EvalKeys(const std::string& client_id,
+                  const std::string& key_ver,
+                  const seal::GaloisKeys& gal,
+                  const seal::RelinKeys& relin);
+
+    // 对应 POST /score/batch
+    ScoreBatchReply ScoreBatch(const ScoreBatchRequest& req);
+
+    // 便捷：设置线程数（SEAL 内部线程池）
+    static void SetNumThreads(int n);
+
+private:
+    const seal::SEALContext& context_;
+    seal::CKKSEncoder encoder_;
+
+    struct KeyBundle { seal::GaloisKeys gal; seal::RelinKeys relin; };
+    std::unordered_map<std::string, KeyBundle> keycache_; // key: client|ver
+
+    // BSGS 内核：按 offsets 旋转 ct_q，乘以对应明文对角并累加
+    seal::Ciphertext DotDiag_BSGS(
+        const seal::Ciphertext& ct_q,
+        const DiagBlock& block,
+        const BSGSPlan& bsgs,
+        const seal::GaloisKeys& gal_keys,
+        seal::Evaluator& evaluator,
+        double target_scale,
+        Telemetry& telem);
+
+    static inline std::string CacheKey(const std::string& c, const std::string& v){
+        return c + "|" + v;
+    }
+};
+

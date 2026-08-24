@@ -1,0 +1,63 @@
+syntax = "proto3";
+package indexsvc;
+
+service IndexService {
+  rpc GetCenters(GetCentersRequest) returns (GetCentersResponse);
+  rpc GetClusterCandidates(GetClusterCandidatesRequest) returns (GetClusterCandidatesResponse);
+  rpc CreateDiagBlocks(CreateDiagBlocksRequest) returns (CreateDiagBlocksResponse);
+}
+
+/**
+ * 条件获取中心快照：
+ * - prev_sha 为空：强制返回当前中心的完整元信息。
+ * - prev_sha 与服务器当前 sha 相等：返回 not_modified=true，其余字段可不填。
+ * - prev_sha 不相等：返回最新元信息（sha/path/dim/num_centers）。
+ */
+message GetCentersRequest {
+  string prev_sha = 1;      // 客户端当前缓存的 sha；为空表示强制获取
+  bool   force    = 2;      // 可选：true 时忽略 prev_sha 强制返回（默认 false）
+}
+
+message GetCentersResponse {
+  string centers_sha  = 1;  // 服务器当前快照 sha256
+  string centers_path = 2;  // 本机可读路径或可下载 URL
+  uint32 dim          = 3;  // 向量维度
+  uint32 num_centers  = 4;  // 中心数量
+  bool   not_modified = 5;  // prev_sha 相同则 true；此时可忽略 centers_path/dim/num_centers
+}
+
+message GetClusterCandidatesRequest {
+  uint32 cluster_id = 1;
+  uint32 top_r      = 2;
+}
+
+message Candidate {
+  uint64 id           = 1;
+  bytes  pq_code      = 2;
+  float  approx_score = 3;
+}
+
+message GetClusterCandidatesResponse {
+  repeated Candidate candidates = 1;
+  uint32 padded_to              = 2;
+}
+
+message CreateDiagBlocksRequest {
+  repeated uint64 candidate_ids = 1;
+  uint32 pack_slots             = 2;
+}
+
+message DiagBlockLayout {
+  string block_id              = 1;
+  string mmap_path             = 2;
+  uint32 slots                 = 3;
+  uint32 stride                = 4;
+  repeated uint32 diag_offsets = 5;
+  // NEW: 槽位到候选ID的映射，长度==slots，不足补0
+  repeated uint64 slot_ids = 6;
+}
+
+message CreateDiagBlocksResponse {
+  repeated DiagBlockLayout blocks = 1;
+}
+

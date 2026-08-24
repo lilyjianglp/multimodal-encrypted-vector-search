@@ -1,0 +1,29 @@
+{
+  "services": {
+    "index_base": "http://127.0.0.1:18086",
+    "he_base":    "http://127.0.0.1:18083"
+  },
+  "gateway": {
+    "listen": "0.0.0.0:50058",
+    "L": 32,
+    "R": 512,
+    "ct_bytes": 16384,
+    "pack_slots": 4096,
+    "p95_ms": 120,
+    "jitter_ms": 15,
+    "out_ct_count": 8,
+    "http_retry_n": 2,
+    "http_retry_ms": 120,
+    "http_retry_jitter": 30,
+    "rate_global_qps": 50,
+    "rate_session_qps": 5,
+    "rate_burst": 2,
+    "quota_session_per_h": 1000,
+
+    "fake_policy": "uniform",
+    "center_weights": [1, 2, 3, 4, 5, 6, 7, 8],
+
+    "cb_fails": 5,
+    "cb_open_ms": 2000
+  }
+}

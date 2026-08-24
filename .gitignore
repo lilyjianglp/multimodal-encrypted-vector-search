@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build
+build/
+cmake-build-debug/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.o
+*.a
+*.so
+*.exe
+
+# Data / model / index artifacts
+data/
+artifacts/
+results/
+logs/
+*.npy
+*.npz
+*.f32
+*.index
+*.dia
+*.snap
+*.pkl
+*.zip
+*.wav
+*.jpg
+*.jpeg
+*.png
+*.csv
+
+# HE / CKKS sensitive files
+*.bin
+*.seal
+*.key
+*sk*
+*secret*
+*eval*
+context.seal
+pk.bin
+sk.bin
+relin*
+galois*
+
+# Runtime outputs
+scores_out/
+scores_raw_raw/
+D0512/
+ct_q.bin
+slot_ids.json
