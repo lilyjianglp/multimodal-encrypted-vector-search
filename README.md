@@ -29,6 +29,7 @@ adapters/
 
 docs/
   Project report, slides, and experiment notes.
+```
 ## Modalities
 
 | Modality | Dataset | Description |
