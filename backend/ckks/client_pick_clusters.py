@@ -35,10 +35,16 @@ def main():
     top_idx = np.argsort(-scores)[:args.topT]      # 真簇索引（数字）
     true_clusters = [str(int(i)) for i in top_idx.tolist()]
 
-    # 伪随机补假簇到 L
+    # 伪随机补充合法的数字簇 ID。旧实现使用 fake_<id>，Gateway 可通过
+    # is_digit_only 直接识别并跳过，因而不能混淆真实簇。数字诱饵会像
+    # 真簇一样进入候选读取，使 Gateway/Index 只看到混合后的簇集合。
     need_fake = max(0, args.L - len(true_clusters))
     rng = prng_from_session(args.session)
-    fake_clusters = [f"fake_{rng.randrange(10**9)}" for _ in range(need_fake)]
+    true_set = {int(i) for i in top_idx.tolist()}
+    decoy_pool = [i for i in range(len(C)) if i not in true_set]
+    if need_fake > len(decoy_pool):
+        raise ValueError(f"L={args.L} exceeds available unique clusters K={len(C)}")
+    fake_clusters = [str(i) for i in rng.sample(decoy_pool, need_fake)]
 
     # 洗牌：混淆真/假顺序
     clusters = true_clusters + fake_clusters

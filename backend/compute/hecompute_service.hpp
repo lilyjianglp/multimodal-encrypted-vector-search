@@ -94,7 +94,8 @@ private:
         int g_step,
         Telemetry& telem);
 
-    // BSGS 内核：按 offsets 旋转 ct_q，乘以对应明文对角并累加
+    // 兼容旧 offset-major 与预旋转 offset-major-bsgs-v1 对角布局。
+    // 后者先按 giant 组完成乘加，再对每组部分和只旋转一次。
     seal::Ciphertext DotDiag_BSGS(
         const seal::Ciphertext& ct_q,
         const DiagBlock& block,
@@ -108,4 +109,3 @@ private:
         return c + "|" + v;
     }
 };
-

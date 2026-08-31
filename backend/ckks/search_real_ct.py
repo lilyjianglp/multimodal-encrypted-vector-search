@@ -29,7 +29,9 @@ print(f"[*] Query MODE = {MODE}")
 
 # ================== 配置 ==================
 GATEWAY_ADDR = os.environ.get("GATEWAY_ADDR", "127.0.0.1:50052")
-CKKS_DIR = Path(os.environ.get("CKKS_DIR", str(Path.home() / "Desktop/backend/ckks")))
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+CKKS_DIR = Path(os.environ.get("CKKS_DIR", str(SCRIPT_DIR)))
 
 CLUSTERS_ENV = os.environ.get("CLUSTERS", "0,1")
 CLUSTERS = [x.strip() for x in CLUSTERS_ENV.split(",") if x.strip()]
@@ -56,7 +58,9 @@ if HMAC_KEY_HEX:
         HMAC_KEY = None
 
 # ================== 生成 Python stub ==================
-PROTO_DIR = Path.home() / "Desktop/backend/gateway/backend/proto"
+PROTO_DIR = Path(os.environ.get(
+    "GATEWAY_PROTO_DIR", str(REPO_ROOT / "backend/gateway/backend/proto")
+))
 PROTO_FILE = PROTO_DIR / "gateway.proto"
 
 if not PROTO_FILE.exists():
@@ -85,8 +89,8 @@ print(f"[*] Loaded ct_q.bin ({len(ct_q)} bytes)")
 
 # ================== 连接 gateway ==================
 opts = [
-    ("grpc.max_send_message_length", 64 * 1024 * 1024),
-    ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+    ("grpc.max_send_message_length", 256 * 1024 * 1024),
+    ("grpc.max_receive_message_length", 256 * 1024 * 1024),
 ]
 chan = grpc.insecure_channel(GATEWAY_ADDR, options=opts)
 grpc.channel_ready_future(chan).result(timeout=5)
@@ -154,7 +158,11 @@ print(f"[*] Metadata added: x-query-mode={MODE}")
 
 # ================== 执行查询 ==================
 t0 = time.time()
-resp = stub.Search(req, timeout=20.0, metadata=metadata)
+resp = stub.Search(
+    req,
+    timeout=float(os.environ.get("GATEWAY_TIMEOUT_SECONDS", "180")),
+    metadata=metadata,
+)
 t1 = time.time()
 
 # ================== 保存密态评分 ==================
@@ -169,4 +177,3 @@ for i, blob in enumerate(resp.scores_ciphertexts):
     (outdir / f"scores_{i:02d}.bin").write_bytes(bytes(blob))
 
 print(f"[OK] scores saved to {outdir}")
-

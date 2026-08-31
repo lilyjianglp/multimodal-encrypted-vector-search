@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package hecompute.v1;
+
+message EvalKeysRequest {
+  string client_id = 1;
+  string key_ver = 2;
+  bytes galois = 3;
+  bytes relin = 4;
+}
+
+message EvalKeysReply {
+  bool ok = 1;
+  string msg = 2;
+}
+
+message BSGSPlan {
+  repeated sint32 baby = 1;
+  repeated sint32 giant = 2;
+}
+
+message DiagLayout {
+  uint32 slots = 1;
+  uint32 stride = 2;
+  repeated sint32 diag_offsets = 3;
+  string packing = 4;
+  uint32 poly_modulus_degree = 5;
+  double scale = 6;
+  sint32 level = 7;
+}
+
+message DiagBlock {
+  string block_id = 1;
+  string snapshot_id = 2;
+  DiagLayout layout = 3;
+  repeated bytes diag_plaintexts = 4;
+}
+
+message ScoreBatchRequest {
+  string client_id = 1;
+  string key_ver = 2;
+  bytes ct_q = 3;
+  BSGSPlan bsgs = 4;
+  repeated DiagBlock blocks = 5;
+  double scale = 6;
+  uint32 out_ct_count = 10;
+  uint32 out_ct_bytes = 11;
+  uint32 pack_slots = 12;
+}
+
+message PackShape {
+  uint32 batch = 1;
+  uint32 slots = 2;
+}
+
+message Telemetry {
+  uint64 lat_us = 1;
+  uint32 rot_cnt = 2;
+  uint32 mul_cnt = 3;
+}
+
+message ScoreBatchReply {
+  repeated bytes scores_ciphertexts = 1;
+  repeated PackShape pack_shapes = 2;
+  Telemetry telemetry = 3;
+}
+
+service HeComputeService {
+  rpc EvalKeys(EvalKeysRequest) returns (EvalKeysReply);
+  rpc ScoreBatch(ScoreBatchRequest) returns (ScoreBatchReply);
+}

@@ -293,7 +293,9 @@ static int build_block_pack(const SEALContext& ctx,
                             VecStore& store,
                             size_t dim,          // e.g. 512 / 768
                             size_t block_offset, // 0,128,256,...
-                            const std::string& out_path)
+                            const std::string& out_path,
+                            bool full_bsgs,
+                            size_t baby_size)
 {
     CKKSEncoder encoder(ctx);
     const double scale = std::pow(2.0, 40);
@@ -324,8 +326,24 @@ static int build_block_pack(const SEALContext& ctx,
         size_t diag = block_offset + t;
         std::vector<double> diag_vec(slot_ids.size());
         for (size_t s=0; s<slot_ids.size(); ++s) {
-            size_t j = diag % dim;          // 当前方案：基于 offset 的对角取值
+            // q is repeated every `dim` slots. After rotating q by `diag`,
+            // slot s contains q[(s + diag) % dim], so the matching matrix
+            // diagonal must contain the same coordinate of candidate s.
+            size_t j = (s + diag) % dim;
             diag_vec[s] = cand[s][j];
+        }
+        if (full_bsgs) {
+            const size_t giant = (diag / baby_size) * baby_size;
+            if (giant != 0) {
+                std::vector<double> adjusted(diag_vec.size());
+                const size_t shift = giant % diag_vec.size();
+                // Store RotPlain(P_diag, -giant). The online evaluator first
+                // accumulates a baby group, then applies one Rot(+giant).
+                for (size_t s = 0; s < diag_vec.size(); ++s) {
+                    adjusted[s] = diag_vec[(s + diag_vec.size() - shift) % diag_vec.size()];
+                }
+                diag_vec.swap(adjusted);
+            }
         }
         Plaintext pt;
         encoder.encode(diag_vec, scale, pt);
@@ -342,13 +360,15 @@ static void usage(const char* prog){
     "Usage:\n"
     "  " << prog << " --context context.seal --ids ids.txt  --dim 768 --outdir data/diag/D0768 --mode random\n"
     "  " << prog << " --context context.seal --ids ids.json --dim 768 --outdir data/diag/D0768 --mode csv   --csv vectors.csv\n"
-    "  " << prog << " --context context.seal --ids ids.txt  --dim 512 --outdir data/diag/D0512 --mode from-npy --npy corpus.npy\n";
+    "  " << prog << " --context context.seal --ids ids.txt  --dim 512 --outdir data/diag/D0512 --mode from-npy --npy corpus.npy [--full-bsgs] [--bsgs-baby 32]\n";
 }
 
 int main(int argc, char** argv){
     std::string context_path, ids_path, outdir="out_diag";
     std::string mode="random", csv_path, npy_path;
     size_t dim = 768;
+    size_t baby_size = 32;
+    bool full_bsgs = false;
 
     for (int i=1;i<argc;i++){
         std::string a = argv[i];
@@ -363,6 +383,8 @@ int main(int argc, char** argv){
         else if (a=="--mode") mode       = need("--mode");
         else if (a=="--csv") csv_path    = need("--csv");
         else if (a=="--npy") npy_path    = need("--npy");
+        else if (a=="--full-bsgs") full_bsgs = true;
+        else if (a=="--bsgs-baby") baby_size = (size_t)std::stoul(need("--bsgs-baby"));
         else { usage(argv[0]); return 1; }
     }
     if (context_path.empty() || ids_path.empty()){ usage(argv[0]); return 1; }
@@ -386,6 +408,10 @@ int main(int argc, char** argv){
         if (slot_ids.size() < 4096) slot_ids.resize(4096, 0);
         else slot_ids.resize(4096);
     }
+    if (baby_size == 0) {
+        std::cerr << "--bsgs-baby must be positive\n";
+        return 1;
+    }
 
     // 3) 准备向量库
     std::unique_ptr<VecStore> store;
@@ -406,6 +432,11 @@ int main(int argc, char** argv){
     }else{
         std::cerr << "unknown --mode: "<< mode <<"\n"; return 1;
     }
+    if (full_bsgs && (slot_ids.size() % dim) != 0) {
+        std::cerr << "full BSGS dense packing requires slot count divisible by dim: slots="
+                  << slot_ids.size() << " dim=" << dim << "\n";
+        return 1;
+    }
 
     // 4) 块数自适应：ceil(dim/128)
     const size_t blk_cnt = (dim + 127) / 128;
@@ -416,7 +447,8 @@ int main(int argc, char** argv){
         char name[64]; std::snprintf(name, sizeof(name), "blk-%06zu.dia", off);
         std::string path = (fs::path(outdir)/name).string();
         std::cerr << "[build] " << path << "\n";
-        if (build_block_pack(ctx, slot_ids, *store, dim, off, path)!=0) return 1;
+        if (build_block_pack(ctx, slot_ids, *store, dim, off, path,
+                             full_bsgs, baby_size)!=0) return 1;
         block_paths.push_back(path);
     }
 
@@ -438,7 +470,11 @@ int main(int argc, char** argv){
         size_t cnt = std::min<size_t>(128, (dim>off ? (dim-off) : 0));
         for (size_t t=0;t<cnt;t++){ if (t) jf << ","; jf << (off+t); }
         jf << "],\n";
-        jf << "        \"packing\": \"offset-major\",\n";
+        jf << "        \"packing\": \""
+           << (full_bsgs ? "offset-major-bsgs-v1" : "offset-major") << "\",\n";
+        jf << "        \"bsgs_baby\": " << baby_size << ",\n";
+        jf << "        \"plaintext_pre_rotated\": "
+           << (full_bsgs ? "true" : "false") << ",\n";
         jf << "        \"poly_modulus_degree\": 8192,\n";
         jf << "        \"scale\": 1099511627776.0,\n";
         jf << "        \"level\": 0\n";
@@ -453,4 +489,3 @@ int main(int argc, char** argv){
     std::cerr << "[OK] diag_blocks.json -> " << json_path << "\n";
     return 0;
 }
-

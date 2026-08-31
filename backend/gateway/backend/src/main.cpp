@@ -1,6 +1,6 @@
 // ====================== gateway/main.cpp (modified) ======================
 #include <grpcpp/grpcpp.h>
-#include "gateway.grpc.pb.h"
+#include <gateway.grpc.pb.h>
 
 #include <chrono>
 #include <thread>
@@ -48,6 +48,7 @@ static int  ENV_L()         { const char* v=getenv("GATEWAY_L");     return v?st
 static int  ENV_R()         { const char* v=getenv("GATEWAY_R");     return v?std::stoi(v):512; }
 static int  ENV_CTBYTES()   { const char* v=getenv("CT_BYTES");      return v?std::stoi(v):16384; }
 static int  ENV_SLOTS()     { const char* v=getenv("PACK_SLOTS");    return v?std::stoi(v):4096; }
+static int  ENV_BSGS_B()    { const char* v=getenv("BSGS_B");       return v?std::stoi(v):32; }
 static int  ENV_P95MS()     { const char* v=getenv("P95_MS");        return v?std::stoi(v):120; }
 static int  ENV_JITTER()    { const char* v=getenv("JITTER_MS");     return v?std::stoi(v):15; }
 static int  ENV_OUTCOUNT()  { const char* v=getenv("OUT_CT_COUNT");  return v?std::stoi(v):8; }
@@ -56,6 +57,7 @@ static int  ENV_OUTCOUNT()  { const char* v=getenv("OUT_CT_COUNT");  return v?st
 static int  ENV_RETRY_N()   { const char* v=getenv("HTTP_RETRY_N");  return v?std::stoi(v):2; }
 static int  ENV_RETRY_MS()  { const char* v=getenv("HTTP_RETRY_MS"); return v?std::stoi(v):120; }
 static int  ENV_RJITTER()   { const char* v=getenv("RETRY_JITTER");  return v?std::stoi(v):30; }
+static long ENV_HTTP_TIMEOUT_SEC() { const char* v=getenv("HTTP_TIMEOUT_SEC"); return v?std::stol(v):300L; }
 
 // 限流
 static double ENV_G_QPS(){ const char* v=getenv("RATE_GLOBAL_QPS"); return v?std::stod(v):50.0; }
@@ -225,7 +227,7 @@ static bool http_post_json(const std::string& url, const json& body, json& out) 
   struct curl_slist* headers = nullptr;
   headers = curl_slist_append(headers, "Content-Type: application/json");
   curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, ENV_HTTP_TIMEOUT_SEC());
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(c, CURLOPT_POST, 1L);
   curl_easy_setopt(c, CURLOPT_POSTFIELDS, s.c_str());
@@ -507,7 +509,16 @@ static bool call_he_B_and_pack(const SearchRequest& req, SearchResponse* resp,
   uint32_t max_off = 0;
   if (diag_blocks.contains("blocks") && diag_blocks["blocks"].is_array()) {
     for (auto& blk : diag_blocks["blocks"]) {
-      if (blk.contains("diag_offsets") && blk["diag_offsets"].is_array()) {
+      if (blk.contains("layout") && blk["layout"].is_object() &&
+          blk["layout"].contains("diag_offsets") &&
+          blk["layout"]["diag_offsets"].is_array()) {
+        for (auto& v : blk["layout"]["diag_offsets"]) {
+          if (v.is_number_unsigned()) max_off = std::max<uint32_t>(max_off, v.get<uint32_t>());
+          else if (v.is_number_integer()) {
+            auto t = v.get<long long>(); if (t > 0) max_off = std::max<uint32_t>(max_off, (uint32_t)t);
+          }
+        }
+      } else if (blk.contains("diag_offsets") && blk["diag_offsets"].is_array()) {
         for (auto& v : blk["diag_offsets"]) {
           if (v.is_number_unsigned()) max_off = std::max<uint32_t>(max_off, v.get<uint32_t>());
           else if (v.is_number_integer()) {
@@ -525,8 +536,8 @@ static bool call_he_B_and_pack(const SearchRequest& req, SearchResponse* resp,
     max_off = (uint32_t)(D - 1);
   }
 
-  // 3) BSGS：b=16，g=ceil((max_off+1)/16)
-  const uint32_t b = 16;
+  // 3) BSGS：默认 b=32；必须与离线预旋转对角块使用的 baby size 一致。
+  const uint32_t b = (uint32_t)std::max(1, ENV_BSGS_B());
   const uint32_t g = (max_off + 1 + b - 1) / b;
   std::vector<uint32_t> baby(b), giant(g);
   for (uint32_t i = 0; i < b; ++i) baby[i] = i;
@@ -922,6 +933,8 @@ int main(int argc, char** argv) {
   std::thread(healthz_thread).detach();
 
   ServerBuilder builder;
+  builder.SetMaxReceiveMessageSize(256 * 1024 * 1024);
+  builder.SetMaxSendMessageSize(256 * 1024 * 1024);
   builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
   builder.RegisterService(&svc);
   std::unique_ptr<Server> server(builder.BuildAndStart());
@@ -1009,4 +1022,3 @@ static bool call_index_A_parallel(const std::vector<std::string>& clusters, uint
   http_retries_a += r; http_ms_a += ms;
   return ok;
 }
-

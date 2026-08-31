@@ -119,7 +119,12 @@ void DiagExporter::export_blocks(const std::vector<uint64_t>& cand_ids, uint32_t
         // offset-major 写 payload：每个 offset 一条长度 slots 的向量
         std::vector<float> slotvec(S_pad, 0.f);
         for (uint32_t off : all_offsets) {
-            for (uint32_t s = 0; s < S; ++s) slotvec[s] = rows[s][off];
+            // The encrypted query is repeated every d slots. A rotation by
+            // `off` puts q[(s + off) % d] at output slot s, so use the same
+            // candidate coordinate on this diagonal.
+            for (uint32_t s = 0; s < S; ++s) {
+                slotvec[s] = rows[s][((size_t)s + off) % d];
+            }
             for (uint32_t s = S; s < S_pad; ++s) slotvec[s] = 0.f;
             ofs.write(reinterpret_cast<const char*>(slotvec.data()), sizeof(float)*S_pad);
         }
@@ -133,4 +138,3 @@ void DiagExporter::export_blocks(const std::vector<uint64_t>& cand_ids, uint32_t
         stride_vec.push_back(1);
     }
 }
-

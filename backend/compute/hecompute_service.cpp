@@ -15,6 +15,7 @@
 #include <thread>
 #include <algorithm>
 #include <iostream>
+#include <map>
 
 using namespace seal;
 
@@ -49,6 +50,10 @@ if (g_step > 0) {
 
 return {g, b};
 
+}
+
+static bool IsFullBsgsPacking(const std::string& packing) {
+return packing.find("bsgs-v1") != std::string::npos;
 }
 
 } // namespace
@@ -236,6 +241,80 @@ if (blk.layout.diag_offsets.size() != blk.diag_plaintexts.size()) {
 
 bool first = true;
 Ciphertext acc;
+
+/*
+ * Full group-level BSGS layout.
+ *
+ * The offline generator stores, for r = g + b:
+ *
+ *   P'_{g,b} = RotPlain(P_r, -g)
+ *
+ * Hence an entire giant group can be accumulated before one ciphertext
+ * rotation:
+ *
+ *   sum_r P_r * Rot(q, r)
+ *     = sum_g Rot(sum_b P'_{g,b} * Rot(q, b), g)
+ *
+ * Online ciphertext rotations become O(sqrt(d)); plaintext multiplications
+ * remain O(d). Legacy offset-major blocks continue through the path below.
+ */
+if (IsFullBsgsPacking(blk.layout.packing)) {
+    if (g_step <= 0) {
+        throw std::invalid_argument("full BSGS packing requires a positive giant step");
+    }
+
+    std::map<int, Ciphertext> group_sums;
+    for (std::size_t i = 0; i < blk.layout.diag_offsets.size(); ++i) {
+        const int rot = blk.layout.diag_offsets[i];
+        auto [g, b] = DecomposeRot(rot, g_step);
+
+        auto bit = baby_cache.find(b);
+        if (bit == baby_cache.end()) {
+            throw std::invalid_argument("missing baby rotation in cache");
+        }
+
+        Ciphertext prod;
+        evaluator.multiply_plain(bit->second, blk.diag_plaintexts[i], prod);
+        telem.mul_cnt++;
+
+        auto group_it = group_sums.find(g);
+        if (group_it == group_sums.end()) {
+            group_sums.emplace(g, std::move(prod));
+        } else {
+            if (group_it->second.parms_id() != prod.parms_id()) {
+                evaluator.mod_switch_to_inplace(group_it->second, prod.parms_id());
+            }
+            evaluator.add_inplace(group_it->second, prod);
+        }
+    }
+
+    for (auto& [g, group_sum] : group_sums) {
+        Ciphertext aligned;
+        Ciphertext* term = &group_sum;
+        if (g != 0) {
+            evaluator.rotate_vector(group_sum, g, gal_keys, aligned);
+            telem.rot_cnt++;
+            term = &aligned;
+        }
+
+        if (first) {
+            acc = std::move(*term);
+            first = false;
+        } else {
+            if (acc.parms_id() != term->parms_id()) {
+                evaluator.mod_switch_to_inplace(acc, term->parms_id());
+            }
+            evaluator.add_inplace(acc, *term);
+        }
+    }
+
+    if (first) {
+        throw std::invalid_argument("empty full BSGS diagonal block");
+    }
+
+    acc.scale() = target_scale;
+    return acc;
+}
 
 for (std::size_t i = 0; i < blk.layout.diag_offsets.size(); ++i) {
     int rot = blk.layout.diag_offsets[i];

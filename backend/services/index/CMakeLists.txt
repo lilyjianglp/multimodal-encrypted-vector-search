@@ -4,9 +4,8 @@ set(CMAKE_CXX_STANDARD 17)
 
 find_package(Protobuf REQUIRED)
 find_package(PkgConfig REQUIRED)
-find_package(OpenMP REQUIRED)
-find_package(BLAS REQUIRED)
-find_package(LAPACK REQUIRED)
+find_package(SQLite3 REQUIRED)
+option(BUILD_TRAIN_OFFLINE "Build the Faiss offline training utility" OFF)
 
 # ---- 找 protoc / grpc_cpp_plugin ----
 find_program(PROTOC protoc)
@@ -51,9 +50,14 @@ add_library(index_proto ${PB_CC} ${GRPC_CC})
 target_include_directories(index_proto PUBLIC ${GEN_DIR} ${Protobuf_INCLUDE_DIRS})
 target_link_libraries(index_proto PUBLIC ${Protobuf_LIBRARIES} ${GRPCPP_LIBRARIES})
 target_include_directories(index_proto PUBLIC ${GRPCPP_INCLUDE_DIRS})
+target_link_directories(index_proto PUBLIC ${GRPCPP_LIBRARY_DIRS})
 
 # ---- 业务源码 ----
-include_directories(${GEN_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(
+  ${GEN_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../gateway/backend/src
+)
 
 set(INDEX_CORE_SRCS
   src/index_service.cc
@@ -69,19 +73,22 @@ add_executable(index_server
 )
 target_link_libraries(index_server
   PRIVATE index_proto ${GRPCPP_LIBRARIES} ${Protobuf_LIBRARIES}
-          sqlite3 faiss
-          ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES}
-          OpenMP::OpenMP_CXX)
+          SQLite::SQLite3)
 target_include_directories(index_server PRIVATE ${GRPCPP_INCLUDE_DIRS})
 
-# ---- 离线训练工具 ----
-add_executable(train_offline
-  src/train_offline.cc
-  src/meta_store.cc
-)
-target_link_libraries(train_offline PRIVATE sqlite3 faiss
-  ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES} OpenMP::OpenMP_CXX
-  ssl crypto)
+# ---- 离线训练工具（生产服务本身不依赖 Faiss）----
+if(BUILD_TRAIN_OFFLINE)
+  find_package(OpenMP REQUIRED)
+  find_package(BLAS REQUIRED)
+  find_package(LAPACK REQUIRED)
+  add_executable(train_offline
+    src/train_offline.cc
+    src/meta_store.cc
+  )
+  target_link_libraries(train_offline PRIVATE sqlite3 faiss
+    ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES} OpenMP::OpenMP_CXX
+    ssl crypto)
+endif()
 
 
 # ---- 运行目录准备 data 结构（可选）----
@@ -104,5 +111,3 @@ target_include_directories(test_slots_client PRIVATE
   ${GRPCPP_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(test_slots_client PRIVATE
   index_proto ${GRPCPP_LIBRARIES} ${Protobuf_LIBRARIES})
-
-

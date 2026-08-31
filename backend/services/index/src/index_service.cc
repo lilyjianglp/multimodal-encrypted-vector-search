@@ -1,4 +1,4 @@
-#include <nlohmann/json.hpp>
+#include "third_party_json.hpp"
 using json = nlohmann::json;
 #include "index_service.hpp"
 #include <grpcpp/grpcpp.h>
@@ -150,8 +150,10 @@ IndexServiceImpl::IndexServiceImpl(std::string data_dir)
                               "mismatch: json blocks size != .dia files count");
     }
 
-    // ---- 4) 构建返回 block 数据 + 正确生成 slot_ids ----
-    size_t global_slot = 0;  // 全局槽指针（最终会生成 16384 长度的 slot_ids）
+    // ---- 4) 构建返回 block 数据 + 按候选包复用 slot_ids ----
+    // 每个候选包会产生 ceil(dim / 128) 个维度块；这些维度块必须共享
+    // 同一组候选 ID，不能像旧实现一样把全局槽指针连续推进。
+    const size_t blocks_per_pack = (g_meta.dim + 127) / 128;
 
     for (size_t i = 0; i < dia_files.size(); ++i) {
 
@@ -172,10 +174,12 @@ IndexServiceImpl::IndexServiceImpl(std::string data_dir)
             blk->add_diag_offsets(v.get<uint32_t>());
         }
 
-        // ---- ★★★ 正确为每个 block 生成 slot_ids ★★★
-        for (size_t s = 0; s < slots; ++s, ++global_slot) {
-            if (global_slot < cand_ids.size())
-                blk->add_slot_ids(cand_ids[global_slot]);
+        const size_t pack_index = blocks_per_pack ? i / blocks_per_pack : 0;
+        const size_t candidate_begin = pack_index * slots;
+        for (size_t s = 0; s < slots; ++s) {
+            const size_t candidate_index = candidate_begin + s;
+            if (candidate_index < cand_ids.size())
+                blk->add_slot_ids(cand_ids[candidate_index]);
             else
                 blk->add_slot_ids(0);
         }
@@ -191,8 +195,6 @@ IndexServiceImpl::IndexServiceImpl(std::string data_dir)
 
     return ::grpc::Status::OK;
 }
-
-
 
 
 

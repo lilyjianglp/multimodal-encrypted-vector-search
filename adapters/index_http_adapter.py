@@ -11,6 +11,7 @@ index_http_adapter.py  — 多维度 & 多 block 版（方案B）
 from flask import Flask, request, jsonify
 import argparse
 import grpc
+import json
 import traceback
 import os
 from math import ceil
@@ -174,58 +175,66 @@ def create_diag_blocks():
         req = pb.CreateDiagBlocksRequest(candidate_ids=norm_ids, pack_slots=pack_slots)
         resp = stub.CreateDiagBlocks(req, timeout=8.0)
 
-        # ★ multimodal 根路径
+        # 多模态对角块根路径；允许测试/部署通过环境变量覆盖。
         mode = j.get("mode", "image")
 
         if mode == "image":
-            base_rel = Path("/home/wen/Desktop/backend/ckks/image") / _dim_dir(dim)
+            base_rel = Path(os.environ.get(
+                "DIAG_ROOT_IMAGE", str(Path("/home/wen/Desktop/backend/ckks/image") / _dim_dir(dim))
+            ))
         elif mode == "audio":
-            base_rel = Path("/home/wen/Desktop/backend/ckks/audio") / _dim_dir(dim)
+            base_rel = Path(os.environ.get(
+                "DIAG_ROOT_AUDIO", str(Path("/home/wen/Desktop/backend/ckks/audio") / _dim_dir(dim))
+            ))
         elif mode == "text":
-            base_rel = Path("/home/wen/Desktop/backend/ckks/text") / _dim_dir(dim)
+            base_rel = Path(os.environ.get(
+                "DIAG_ROOT_TEXT", str(Path("/home/wen/Desktop/backend/ckks/text") / _dim_dir(dim))
+            ))
         else:
             return jsonify({"error": "bad_mode", "details": mode}), 400
 
-        # 块数：每块 128 个 offset
-        blk_cnt = ceil(dim / 128)
+        # The IndexService proto predates layout versioning and does not carry
+        # `packing`. Recover it from the generated metadata so HECompute can
+        # select the true group-level BSGS kernel while legacy blocks remain
+        # compatible.
+        generated_layouts = {}
+        metadata_path = base_rel / "diag_blocks.json"
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            for item in metadata.get("blocks", []):
+                name = Path(str(item.get("mmap_path", ""))).name
+                if name:
+                    generated_layouts[name] = item.get("layout", {}) or {}
 
         grpc_blocks = list(resp.blocks)
-        # slot_ids：优先使用 gRPC 返回；否则用 candidates 填满（不足补 0，超出截断）
-        if grpc_blocks and len(grpc_blocks[0].slot_ids) > 0:
-            slot_ids = list(grpc_blocks[0].slot_ids)
-        else:
-            slot_ids = (norm_ids + [0] * (pack_slots - len(norm_ids)))[:pack_slots]
-
         blocks = []
-        for i in range(blk_cnt):
-            # 该 block 覆盖的 offset 区间
-            start_off = i * 128
-            end_off = min(start_off + 128, dim)
-            offs = list(range(start_off, end_off))
-
-            # 若 gRPC 有对应块并给了 diag_offsets，则优先
-            if i < len(grpc_blocks) and len(grpc_blocks[i].diag_offsets) > 0:
-                offs = list(grpc_blocks[i].diag_offsets)
-
-            block_offset = offs[0] if offs else start_off
-            mmap_path = str(base_rel / _blk_name(block_offset))  # e.g. data/diag/D0512/blk-000128.dia
+        for i, grpc_block in enumerate(grpc_blocks):
+            offs = list(grpc_block.diag_offsets)
+            block_id = grpc_block.block_id or f"blk-{i:06d}"
+            mmap_name = grpc_block.mmap_path or block_id
+            mmap_path = str(base_rel / Path(mmap_name).name)
+            slot_ids = list(grpc_block.slot_ids)
+            generated_layout = generated_layouts.get(Path(mmap_name).name, {})
 
             layout = {
-                "slots": 4096,
-                "stride": 4096,                # ★ 一定固定 4096
+                "slots": int(grpc_block.slots or pack_slots),
+                "stride": int(grpc_block.stride or pack_slots),
                 "poly_modulus_degree": 8192,
                 "scale": SCALE_40,
                 "level": 0,
-                "packing": "offset-major",
+                "packing": generated_layout.get("packing", "offset-major"),
                 "diag_offsets": offs
             }
             blocks.append({
-                "block_id": f"blk-{block_offset:06d}",
+                "block_id": block_id,
                 "snapshot_id": "",
                 "mmap_path": mmap_path,
                 "layout": layout,
                 "slot_ids": slot_ids
             })
+
+        if not blocks:
+            return jsonify({"error": "empty_diag_plan"}), 500
 
         # 日志友好：附带 echo 维度/根目录
         return jsonify({"dim": dim, "root": str(base_rel), "blocks": blocks})
@@ -242,12 +251,12 @@ def main():
     global _GRPC_ADDR
     ap = argparse.ArgumentParser()
     ap.add_argument("--grpc", default="127.0.0.1:50051", help="IndexService gRPC address")
+    ap.add_argument("--host", default="127.0.0.1", help="HTTP bind address")
     ap.add_argument("--port", type=int, default=18081, help="HTTP listen port")
     args = ap.parse_args()
 
     _GRPC_ADDR = args.grpc
-    app.run(host="0.0.0.0", port=args.port)
+    app.run(host=args.host, port=args.port)
 
 if __name__ == "__main__":
     main()
-

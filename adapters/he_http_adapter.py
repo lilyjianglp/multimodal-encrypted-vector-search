@@ -110,7 +110,7 @@ def _scan_max_offset_from_blocks(diag_obj: dict) -> int:
 def _build_bsgs_if_empty(payload: dict) -> Tuple[List[int], List[int]]:
     """
     若请求没有 bsgs/bsgs_plan，则自动生成：
-      baby = [0..b-1]  (b = env BSGS_B or 16)
+      baby = [0..b-1]  (b = env BSGS_B or 32)
       giant = [0, b, 2b, ...] 覆盖到 max_offset
       max_offset 来自 diag_offsets；如无则取 dim-1
     """
@@ -131,8 +131,8 @@ def _build_bsgs_if_empty(payload: dict) -> Tuple[List[int], List[int]]:
     if max_off < 0:
         max_off = max(0, dim - 1)
 
-    b = safe_int(os.environ.get("BSGS_B", 16), 16)
-    if b <= 0: b = 16
+    b = safe_int(os.environ.get("BSGS_B", 32), 32)
+    if b <= 0: b = 32
 
     baby  = list(range(b))
     gcnt  = (max_off + 1 + b - 1) // b
@@ -210,11 +210,17 @@ def create_app(grpc_addr: str):
         mode = j.get("mode", "image")  # default image
 
         if mode == "image":
-            os.environ["DIAG_ROOT"] = "/home/wen/Desktop/backend/ckks/image/D0512"
+            os.environ["DIAG_ROOT"] = os.environ.get(
+                "DIAG_ROOT_IMAGE", "/home/wen/Desktop/backend/ckks/image/D0512"
+            )
         elif mode == "audio":
-            os.environ["DIAG_ROOT"] = "/home/wen/Desktop/backend/ckks/audio/D0512"
+            os.environ["DIAG_ROOT"] = os.environ.get(
+                "DIAG_ROOT_AUDIO", "/home/wen/Desktop/backend/ckks/audio/D0512"
+            )
         elif mode == "text":
-            os.environ["DIAG_ROOT"] = "/home/wen/Desktop/backend/ckks/text/D0512"
+            os.environ["DIAG_ROOT"] = os.environ.get(
+                "DIAG_ROOT_TEXT", "/home/wen/Desktop/backend/ckks/text/D0512"
+            )
         print(f"[he_http_adapter] MODE={mode}, DIAG_ROOT={os.environ['DIAG_ROOT']}", flush=True)
          # ---- Force override diag_blocks.root ----
         if "diag_blocks" in j and isinstance(j["diag_blocks"], dict):
@@ -252,7 +258,6 @@ def create_app(grpc_addr: str):
 
         diag = j.get("diag_blocks") or j.get("blocks") or {}
         blocks_in = diag.get("blocks", []) if isinstance(diag, dict) else []
-        blocks_in = blocks_in[:4]  # 512 dims = four 128-d blocks
         print("[he_http_adapter] received blocks_in=", len(blocks_in), [(b.get("block_id"), b.get("mmap_path")) for b in blocks_in], flush=True)
 
         for idx, blk_in in enumerate(blocks_in):
@@ -286,8 +291,12 @@ def create_app(grpc_addr: str):
                     full_path = os.path.join(os.environ["DIAG_ROOT"], mmap_path)
                     pts = _read_diag_pack(mmap_path)  # 期望得到 128 条
                     used_source = f"mmap:{full_path}"
-                    start = _infer_block_start(blk_in, mmap_path, idx)
-                    layout.diag_offsets.extend(list(range(start, start + len(pts))))
+                    declared_offsets = ly.get("diag_offsets", [])
+                    if isinstance(declared_offsets, list) and len(declared_offsets) == len(pts):
+                        layout.diag_offsets.extend(int(value) for value in declared_offsets)
+                    else:
+                        start = _infer_block_start(blk_in, mmap_path, idx)
+                        layout.diag_offsets.extend(list(range(start, start + len(pts))))
                 except Exception as e:
                     print(f"[he_http_adapter] bad_diag_mmap block={idx} error={e}", flush=True)
                     return jsonify({"error":"bad_diag_mmap", "block": idx, "details": str(e)}), 400
@@ -298,8 +307,12 @@ def create_app(grpc_addr: str):
                 raw_list = blk_in.get("diag_plaintexts", [])
                 for p in raw_list:
                     pts.append(b64d(p))
-                start = _infer_block_start(blk_in, "", idx)
-                layout.diag_offsets.extend(list(range(start, start + len(pts))))
+                declared_offsets = ly.get("diag_offsets", [])
+                if isinstance(declared_offsets, list) and len(declared_offsets) == len(pts):
+                    layout.diag_offsets.extend(int(value) for value in declared_offsets)
+                else:
+                    start = _infer_block_start(blk_in, "", idx)
+                    layout.diag_offsets.extend(list(range(start, start + len(pts))))
 
             total_diag_pts += len(pts)
             blk_msg = pb.DiagBlock(
@@ -318,7 +331,10 @@ def create_app(grpc_addr: str):
                 # ---- 自动保存完整 slot_ids.json（所有 block 拼接）----
         try:
             slot_ids_all = []
-            for blk in blocks_in:
+            blocks_per_pack = max(1, (max(1, _pick_dim(j)) + 127) // 128)
+            for block_index, blk in enumerate(blocks_in):
+                if block_index % blocks_per_pack != 0:
+                    continue
                 ids = blk.get("slot_ids", [])
                 if isinstance(ids, list):
                     slot_ids_all.extend(ids)
@@ -341,31 +357,50 @@ def create_app(grpc_addr: str):
         # —— gRPC —— 
         try:
             grpc.channel_ready_future(channel).result(timeout=3)
-            req = pb.ScoreBatchRequest(
-                client_id=client_id,
-                key_ver=key_ver,
-                ct_q=ct_q_bytes,
-                bsgs=bsgs,
-                blocks=blocks_msg,
-                scale=scale,
-                out_ct_count=out_ct_count,
-                out_ct_bytes=out_ct_bytes,
-                pack_slots=pack_slots,
-            )
-            rep = stub.ScoreBatch(req, timeout=120, wait_for_ready=True)
+            # One 512-D candidate pack has four 128-diagonal blocks. Send one
+            # pack per gRPC call to keep message size bounded, then concatenate
+            # ciphertexts in candidate-pack order for the Gateway/client.
+            blocks_per_pack = max(1, (max(1, _pick_dim(j)) + 127) // 128)
+            replies = []
+            for begin in range(0, len(blocks_msg), blocks_per_pack):
+                req = pb.ScoreBatchRequest(
+                    client_id=client_id,
+                    key_ver=key_ver,
+                    ct_q=ct_q_bytes,
+                    bsgs=bsgs,
+                    blocks=blocks_msg[begin:begin + blocks_per_pack],
+                    scale=scale,
+                    out_ct_count=blocks_per_pack,
+                    out_ct_bytes=out_ct_bytes,
+                    pack_slots=pack_slots,
+                )
+                replies.append(stub.ScoreBatch(req, timeout=120, wait_for_ready=True))
 
-            # 直接回传 gRPC 返回的密文（base64）
-            blobs = [b64e(x) for x in rep.scores_ciphertexts]
+            blobs = [
+                b64e(ciphertext)
+                for rep in replies
+                for ciphertext in rep.scores_ciphertexts
+            ]
+            shapes = [
+                {"batch": shape.batch, "slots": shape.slots}
+                for rep in replies
+                for shape in rep.pack_shapes
+            ]
             body = {
                 "packed_scores": blobs,
-                "packShapes": [{"batch": s.batch, "slots": s.slots} for s in rep.pack_shapes],
+                "packShapes": shapes,
                 "telemetry": {
-                    "lat_us": getattr(rep.telemetry, "lat_us", 0),
-                    "rot_cnt": getattr(rep.telemetry, "rot_cnt", 0),
-                    "mul_cnt": getattr(rep.telemetry, "mul_cnt", 0),
+                    "lat_us": sum(getattr(rep.telemetry, "lat_us", 0) for rep in replies),
+                    "rot_cnt": sum(getattr(rep.telemetry, "rot_cnt", 0) for rep in replies),
+                    "mul_cnt": sum(getattr(rep.telemetry, "mul_cnt", 0) for rep in replies),
                 }
             }
-            print(f"[he_http_adapter] ScoreBatch -> ok blocks={len(blocks_msg)} out_n={len(blobs)}", flush=True)
+            print(
+                f"[he_http_adapter] ScoreBatch -> ok blocks={len(blocks_msg)} out_n={len(blobs)} "
+                f"lat_us={body['telemetry']['lat_us']} rot_cnt={body['telemetry']['rot_cnt']} "
+                f"mul_cnt={body['telemetry']['mul_cnt']}",
+                flush=True,
+            )
             return jsonify(body)
 
         except grpc.RpcError as e:
@@ -380,8 +415,9 @@ def create_app(grpc_addr: str):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--grpc", default="127.0.0.1:18082", help="HeCompute gRPC address")
+    ap.add_argument("--host", default="127.0.0.1", help="HTTP bind address")
     ap.add_argument("--port", type=int, default=18083, help="HTTP listen port")
     args = ap.parse_args()
 
     app = create_app(args.grpc)
-    app.run(host="0.0.0.0", port=args.port)
+    app.run(host=args.host, port=args.port)

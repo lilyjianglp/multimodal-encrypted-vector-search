@@ -2,10 +2,12 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 venv/
 
 # Build
 build/
+build-*/
 cmake-build-debug/
 CMakeFiles/
 CMakeCache.txt
