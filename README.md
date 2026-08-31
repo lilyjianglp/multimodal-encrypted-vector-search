@@ -26,6 +26,12 @@ HECompute
 Client decrypts candidate scores and recovers Top-K
 ```
 
+![CKKS SIMD, diagonal packing, and BSGS data flow](docs/ckks_simd_diagonal_bsgs.png)
+
+The diagram shows the production data layout: the 512-dimensional query is
+repeated eight times in 4096 CKKS slots; 4096 candidate vectors are distributed
+over 512 encoded diagonals; each output slot contains one candidate score.
+
 The original multimodal evaluation uses a unified 512-dimensional embedding
 format for:
 
@@ -115,6 +121,32 @@ HECompute used 16 real clusters plus 16 decoy clusters (49,152 slots):
 This single network query is a functional end-to-end validation, not a latency
 mean or P95. See [the SIFT1M experiment audit](docs/sift1m_private_ann_comparison.md)
 for definitions, matched A/B results, and comparison boundaries.
+
+### Why the network wall time is larger than the HE-core time
+
+The reported `1.202 s/query` is **not CKKS query encryption**. It is the mean
+HE scoring time for 24,576 real candidates (6 packs), measured inside the local
+benchmark without Gateway, Index, decoys, or network serialization.
+
+The current real-process test handles 49,152 slots (12 packs) because it adds
+16 decoy clusters. Its measured boundaries are:
+
+| Boundary | Candidate workload | Time |
+| --- | ---: | ---: |
+| Local full-BSGS HE core | 24,576 / 6 packs | 1.202 s |
+| Network-test HE telemetry | 49,152 / 12 packs | 3.161 s |
+| Client request/response wall time | 49,152 / 12 packs | 9.399 s |
+
+The remaining time includes 32 cluster candidate requests, SQLite/index work,
+loading and parsing 48 precomputed diagonal files, Python/JSON/Base64 and gRPC
+serialization, twelve adapter-to-HECompute calls, returning 48 ciphertexts
+(18.38 MiB), and Gateway/client protocol handling. The one-time 37.57 MiB
+evaluation-key upload is not charged to every query.
+
+The older `17.538 s` figure was measured before full group-level BSGS. It is
+retained only as an A/B baseline; the corresponding current request/response
+measurement is `9.399 s`. Query encryption and result decryption are separate
+client operations and were not included in that RPC wall-time interval.
 
 ## Security Boundary
 
